@@ -4,8 +4,8 @@
   "description": "card_game_preidiction_model",
   "main": "index.js",
   "scripts": {
-    "test": "start",
-    "start": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "start": "node index.js"
   },
   "author": "",
   "license": "ISC",

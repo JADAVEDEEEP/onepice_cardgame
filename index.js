@@ -1,16 +1,35 @@
+//importing the required modules so we can use their moudueles fucnality in our code
+require("dotenv").config();
 const express = require('express');
 const bodyparser = require('body-parser');
+const cors = require("cors");
 const cards = require('./routes/card');
-connectDB = require('./config/configdb');
+const meta = require('./routes/meta');
+const connectDB = require('./config/configdb');
 const app = express();
 
-
+//connect to the database
 connectDB();
+//parssing the incoimg request body as json data in to the javascript object
 app.use(bodyparser.json());
+const allowedOrigins = (process.env.CORS_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
 
+app.use(
+  cors({
+    origin: allowedOrigins.length > 0 ? allowedOrigins : true,
+  })
+);
+
+//importing the cards route with mddileare verfication 
+//this how we know which api its and whatver api req start with cardsApi that move 
 app.use('/cardsApi',cards)
+app.use('/meta', meta);
 
 
-app.listen(3000, () => {
-    console.log('Server is running on port 3000');
+const port = Number(process.env.PORT) || 3000;
+app.listen(port, () => {
+    console.log(`Server is running on port ${port}`);
 });

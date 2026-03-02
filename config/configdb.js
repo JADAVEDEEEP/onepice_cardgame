@@ -1,12 +1,15 @@
 const mongoose = require("mongoose");
 
+// Connect MongoDB using environment variable for production safety
 const connectDB = async () => {
   try {
-    await mongoose.connect(
-      "mongodb+srv://jadavdeep560_db_user:bSiiJsKaASjZMf9v@mediware-cluster.xnwbxvv.mongodb.net/card_Game"
-    );
+    const mongoUri = process.env.MONGO_URI;
+    if (!mongoUri) {
+      throw new Error("MONGO_URI is not configured");
+    }
 
-    console.log("MongoDB Connected 🚀");
+    await mongoose.connect(mongoUri);
+    console.log("MongoDB Connected");
   } catch (error) {
     console.error("Mongo Error:", error.message);
     process.exit(1);
