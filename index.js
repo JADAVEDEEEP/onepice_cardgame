@@ -7,6 +7,7 @@ const cards = require('./routes/card');
 const meta = require('./routes/meta');
 const connectDB = require('./config/configdb');
 const app = express();
+const defaultOrigins = ["https://onepice-cardgame-frontend.vercel.app"];
 
 //connect to the database
 connectDB();
@@ -15,11 +16,14 @@ app.use(bodyparser.json());
 const allowedOrigins = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
-  .filter(Boolean);
+  .filter(Boolean)
+  .map((origin) => origin.replace(/\/+$/, ""));
+
+const corsOrigins = Array.from(new Set([...defaultOrigins, ...allowedOrigins]));
 
 app.use(
   cors({
-    origin: allowedOrigins.length > 0 ? allowedOrigins : true,
+    origin: corsOrigins.length > 0 ? corsOrigins : true,
   })
 );
 
