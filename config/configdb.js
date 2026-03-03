@@ -9,10 +9,10 @@ const connectDB = async () => {
       throw new Error("HARDCODED_MONGO_URI is not configured");
     }
 
-    await mongoose.connect(mongoUri);
+    await mongoose.connect(mongoUri, { serverSelectionTimeoutMS: 10000 });
     console.log("MongoDB Connected");
   } catch (error) {
-    console.error("Mongo Error:", error.message);
+    console.error("Mongo Error:", error);
     process.exit(1);
   }
 };
