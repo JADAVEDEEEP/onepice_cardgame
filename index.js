@@ -20,10 +20,20 @@ const allowedOrigins = (process.env.CORS_ORIGINS || "")
   .map((origin) => origin.replace(/\/+$/, ""));
 
 const corsOrigins = Array.from(new Set([...defaultOrigins, ...allowedOrigins]));
+const vercelPreviewPattern = /^https:\/\/onepice-cardgame-frontend(-[a-z0-9-]+)?\.vercel\.app$/i;
 
 app.use(
   cors({
-    origin: corsOrigins.length > 0 ? corsOrigins : true,
+    origin: (origin, callback) => {
+      // Requests from tools like Postman/curl may not send Origin.
+      if (!origin) return callback(null, true);
+
+      const normalizedOrigin = origin.replace(/\/+$/, "");
+      if (corsOrigins.includes(normalizedOrigin)) return callback(null, true);
+      if (vercelPreviewPattern.test(normalizedOrigin)) return callback(null, true);
+
+      return callback(new Error(`CORS blocked for origin: ${origin}`));
+    },
   })
 );
 
