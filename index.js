@@ -13,12 +13,18 @@ connectDB();
 //parssing the incoimg request body as json data in to the javascript object
 app.use(bodyparser.json());
 const allowedOrigins = ["https://onepice-cardgame-frontend.vercel.app"];
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error("Not allowed by CORS"));
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
 
-app.use(
-  cors({
-    origin: allowedOrigins.length > 0 ? allowedOrigins : true,
-  })
-);
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 
 app.get('/',(req,res)=>{
