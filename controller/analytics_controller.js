@@ -374,6 +374,183 @@ const buildRecommendedCards = (optimizationSuggestions, allCardsByCode) => {
   return recommended;
 };
 
+const scoreCardForDeck = (card, context) => {
+  const roles = detectCardRoles(card);
+  const playstyle = context.playstyle || "balanced";
+  const riskMode = context.riskMode || "consistency";
+  const metaContext = context.metaContext || "balanced";
+
+  let score = 0;
+
+  // Base value from raw stat profile.
+  score += clamp(card.power / 120, 0, 100) * 0.25;
+  score += clamp(card.counter_value / 20, 0, 100) * 0.2;
+  score += (card.type === "event" ? 65 : 45) * 0.1;
+
+  // Curve fit.
+  if (playstyle === "aggressive") {
+    score += card.cost <= 2 ? 22 : card.cost <= 4 ? 12 : 4;
+  } else if (playstyle === "control") {
+    score += card.cost >= 5 ? 20 : card.cost >= 3 ? 12 : 6;
+  } else {
+    score += card.cost >= 2 && card.cost <= 5 ? 18 : 8;
+  }
+
+  // Role bonuses.
+  if (roles.includes("searcher")) score += 14;
+  if (roles.includes("draw")) score += 12;
+  if (roles.includes("blocker")) score += 10;
+  if (roles.includes("removal")) score += 12;
+  if (roles.includes("finisher")) score += 10;
+
+  // Meta context bias.
+  if (metaContext === "fast-aggro" && roles.includes("blocker")) score += 10;
+  if (metaContext === "fast-aggro" && roles.includes("removal")) score += 8;
+  if (metaContext === "control-heavy" && roles.includes("finisher")) score += 8;
+  if (metaContext === "removal-heavy" && card.counter_value >= 1000) score += 6;
+
+  // Risk mode.
+  if (riskMode === "consistency") {
+    if (card.counter_value >= 1000) score += 6;
+    if (card.cost <= 3) score += 6;
+  } else {
+    if (card.power >= 7000) score += 8;
+    if (roles.includes("finisher")) score += 8;
+  }
+
+  return score;
+};
+
+const getRoleLabel = (card) => {
+  const roles = detectCardRoles(card);
+  if (roles.includes("removal")) return "Removal";
+  if (roles.includes("searcher") || roles.includes("draw")) return "Draw";
+  if (roles.includes("blocker")) return "Blocker";
+  if (roles.includes("finisher")) return "Finisher";
+  return "Engine";
+};
+
+const generateDeckFromPool = ({ pool, deckSize, playstyle, riskMode, metaContext }) => {
+  const scored = pool
+    .map((card) => ({
+      card,
+      score: scoreCardForDeck(card, { playstyle, riskMode, metaContext }),
+      role: getRoleLabel(card),
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  const desiredRoleTargets =
+    playstyle === "aggressive"
+      ? { Removal: 8, Blocker: 6, Draw: 5, Finisher: 4, Engine: 27 }
+      : playstyle === "control"
+      ? { Removal: 12, Blocker: 8, Draw: 6, Finisher: 6, Engine: 18 }
+      : { Removal: 10, Blocker: 7, Draw: 6, Finisher: 5, Engine: 22 };
+
+  const deckMap = new Map();
+  const roleCounts = { Removal: 0, Blocker: 0, Draw: 0, Finisher: 0, Engine: 0 };
+  let total = 0;
+
+  const tryAddCard = (entry) => {
+    const code = entry.card.card_code;
+    const current = deckMap.get(code) || 0;
+    if (current >= 4) return false;
+    if (total >= deckSize) return false;
+    deckMap.set(code, current + 1);
+    roleCounts[entry.role] += 1;
+    total += 1;
+    return true;
+  };
+
+  // First pass: satisfy role targets.
+  for (const [role, target] of Object.entries(desiredRoleTargets)) {
+    let guard = 0;
+    while (roleCounts[role] < target && guard < 2000) {
+      guard += 1;
+      const candidate = scored.find((entry) => entry.role === role && (deckMap.get(entry.card.card_code) || 0) < 4);
+      if (!candidate) break;
+      if (!tryAddCard(candidate)) break;
+    }
+  }
+
+  // Fill remaining by best score.
+  for (const entry of scored) {
+    while (total < deckSize && (deckMap.get(entry.card.card_code) || 0) < 4) {
+      if (!tryAddCard(entry)) break;
+    }
+    if (total >= deckSize) break;
+  }
+
+  const deckCards = Array.from(deckMap.entries())
+    .map(([code, count]) => {
+      const base = scored.find((entry) => entry.card.card_code === code);
+      if (!base) return null;
+      return {
+        count,
+        name: base.card.name,
+        code: base.card.card_code,
+        role: base.role,
+        cost: base.card.cost,
+        power: base.card.power,
+        counter: base.card.counter_value,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.cost - b.cost || b.count - a.count);
+
+  return { deckCards, total };
+};
+
+const buildBestColorStats = (cards) => {
+  const colors = ["red", "blue", "green", "purple", "black", "yellow"];
+  const matchupBase = {
+    red: { bad: 2, fit: 64 },
+    blue: { bad: 2, fit: 61 },
+    green: { bad: 3, fit: 57 },
+    purple: { bad: 2, fit: 60 },
+    black: { bad: 3, fit: 56 },
+    yellow: { bad: 4, fit: 54 },
+  };
+
+  const total = cards.length || 1;
+  const rows = colors.map((color) => {
+    const pool = cards.filter((card) => card.color === color);
+    const pickRate = Math.round((pool.length / total) * 1000) / 10;
+    const avgPower = pool.length ? pool.reduce((s, c) => s + c.power, 0) / pool.length : 0;
+    const avgCounter = pool.length ? pool.reduce((s, c) => s + c.counter_value, 0) / pool.length : 0;
+    const removals = pool.filter((c) => detectCardRoles(c).includes("removal")).length;
+    const blockers = pool.filter((c) => detectCardRoles(c).includes("blocker")).length;
+    const searchers = pool.filter((c) => detectCardRoles(c).includes("searcher")).length;
+    const leaders = pool.filter((c) => c.type === "leader").slice(0, 3).map((c) => c.card_code);
+
+    const consistency = clamp(Math.round((avgCounter / 20) * 45 + clamp((searchers / Math.max(pool.length, 1)) * 400) + 20));
+    const winRate = clamp(
+      Math.round(
+        42 +
+          (avgPower / 10000) * 20 +
+          (avgCounter / 2000) * 16 +
+          clamp((removals / Math.max(pool.length, 1)) * 180) * 0.25 +
+          clamp((blockers / Math.max(pool.length, 1)) * 180) * 0.2
+      ),
+      35,
+      75
+    );
+
+    return {
+      color,
+      win_rate: winRate,
+      pick_rate: pickRate,
+      bad_matchups_count: matchupBase[color].bad,
+      consistency,
+      skill_floor: color === "red" || color === "green" ? 6 : 7,
+      skill_ceiling: color === "blue" || color === "yellow" ? 10 : 9,
+      top_leaders: leaders,
+      meta_fit: matchupBase[color].fit,
+    };
+  });
+
+  return rows.sort((a, b) => b.win_rate - a.win_rate);
+};
+
 const buildTargetPlan = ({ archetype, deckSize }) => {
   const targetsByArchetype = {
     aggro: {
@@ -467,6 +644,133 @@ const buildNextBestSwaps = ({ optimizationSuggestions, expandedDeck, allCardsByC
   }
 
   return swaps;
+};
+
+const bestColorFinder = async (req, res) => {
+  try {
+    const cardsRaw = await cardsDb.find({}).lean();
+    const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
+    const colorStats = buildBestColorStats(activeCards);
+    const topColor = colorStats[0] || null;
+
+    return res.json({
+      colorStats,
+      topRecommendation: topColor,
+      reasons: topColor
+        ? [
+            { type: "matchup", text: `Favorable profile with only ${topColor.bad_matchups_count} difficult matchups` },
+            { type: "trend", text: `Meta fit score ${topColor.meta_fit}/100 for current tournament environment` },
+            { type: "consistency", text: `Consistency score ${topColor.consistency}/100 for reliable performance` },
+            { type: "meta", text: `Leader pool available: ${(topColor.top_leaders || []).length} strong options` },
+          ]
+        : [],
+      generated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to compute best color stats", error: error.message });
+  }
+};
+
+const generateBestDeck = async (req, res) => {
+  try {
+    const color = normalizeText(req.body?.color || "red");
+    const playstyle = normalizeText(req.body?.playstyle || "balanced");
+    const riskMode = normalizeText(req.body?.riskMode || "consistency");
+    const metaContext = normalizeText(req.body?.metaContext || "balanced");
+    const preferredLeader = normalizeText(req.body?.leader || "");
+    const deckSize = clamp(parseNumber(req.body?.deckSize, 50), 40, 60);
+
+    const cardsRaw = await cardsDb.find({}).lean();
+    const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
+    const colorPool = activeCards.filter((card) => card.color === color && card.type !== "leader");
+    const leaders = activeCards.filter((card) => card.color === color && card.type === "leader");
+
+    const selectedLeader =
+      leaders.find((l) => normalizeText(l.name).includes(preferredLeader)) ||
+      leaders.sort((a, b) => b.power - a.power)[0] ||
+      null;
+
+    const { deckCards } = generateDeckFromPool({
+      pool: colorPool,
+      deckSize,
+      playstyle,
+      riskMode,
+      metaContext,
+    });
+
+    const total = deckCards.reduce((s, c) => s + c.count, 0) || 1;
+    const eventCount = deckCards.filter((c) => c.role === "Removal").reduce((s, c) => s + c.count, 0);
+    const blockerCount = deckCards.filter((c) => c.role === "Blocker").reduce((s, c) => s + c.count, 0);
+    const lowCost = deckCards.filter((c) => c.cost <= 3).reduce((s, c) => s + c.count, 0);
+    const avgCost = deckCards.reduce((s, c) => s + c.cost * c.count, 0) / total;
+    const counterDensity = Math.round((deckCards.reduce((s, c) => s + (c.counter > 0 ? c.count : 0), 0) / total) * 100);
+
+    const optimizationScore = clamp(
+      Math.round(
+        35 +
+          Math.min(25, lowCost * 0.5) +
+          Math.min(15, blockerCount * 1.5) +
+          Math.min(15, eventCount * 1.1) +
+          Math.min(10, counterDensity * 0.08)
+      )
+    );
+
+    const analytics = {
+      consistency: clamp(Math.round(65 + counterDensity * 0.2)),
+      tempo: clamp(Math.round(55 + (lowCost / total) * 100 * 0.5)),
+      control: clamp(Math.round(45 + (eventCount / total) * 100 * 1.2)),
+      lateGame: clamp(Math.round(50 + deckCards.filter((c) => c.cost >= 7).reduce((s, c) => s + c.count, 0) * 3)),
+      brickRisk: clamp(Math.round(22 - lowCost * 0.4), 5, 50),
+      counterDensity,
+    };
+
+    const curveMap = new Map();
+    for (const card of deckCards) curveMap.set(card.cost, (curveMap.get(card.cost) || 0) + card.count);
+    const curve = Array.from({ length: 9 }).map((_, idx) => {
+      const cost = idx < 8 ? idx + 1 : "9+";
+      const count = idx < 8 ? curveMap.get(idx + 1) || 0 : deckCards.filter((c) => c.cost >= 9).reduce((s, c) => s + c.count, 0);
+      return { cost, count };
+    });
+
+    const matchupBase = {
+      red: [66, 60, 58, 63, 55],
+      blue: [57, 64, 61, 59, 62],
+      green: [61, 58, 57, 60, 59],
+      purple: [59, 60, 63, 57, 58],
+      black: [58, 59, 60, 62, 56],
+      yellow: [55, 57, 58, 56, 64],
+    };
+
+    const matchupLeaders = ["Red Aggro", "Blue Control", "Purple Ramp", "Black Midrange", "Yellow Value"];
+    const matchupPreview = matchupLeaders.map((leader, idx) => ({
+      leader,
+      winRate: clamp((matchupBase[color] || matchupBase.red)[idx] + Math.round((optimizationScore - 70) * 0.08), 35, 75),
+    }));
+
+    const insights = [
+      `Curve tuned for ${playstyle} profile with avg cost ${avgCost.toFixed(1)}.`,
+      `Counter density at ${counterDensity}% for defensive stability.`,
+      `Event/removal package includes ${eventCount} slots for board interaction.`,
+      `Blocker coverage at ${blockerCount} improves aggro survivability.`,
+      `Estimated optimization score ${optimizationScore}/100 under ${metaContext} meta context.`,
+    ];
+
+    return res.json({
+      leader: selectedLeader
+        ? { name: selectedLeader.name, code: selectedLeader.card_code, image_url: selectedLeader.image_url }
+        : null,
+      tags: [playstyle, riskMode, color],
+      optimizationScore,
+      analytics,
+      deckCards,
+      insights,
+      curve,
+      matchupPreview,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to generate best deck", error: error.message });
+  }
 };
 
 const optimizeDeck = async (req, res) => {
@@ -566,5 +870,7 @@ const optimizeDeck = async (req, res) => {
 };
 
 module.exports = {
+  bestColorFinder,
+  generateBestDeck,
   optimizeDeck,
 };
