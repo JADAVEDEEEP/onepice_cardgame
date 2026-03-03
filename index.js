@@ -23,6 +23,10 @@ app.use(
   })
 );
 
+
+app.get('/',(req,res)=>{
+  res.send("Welcome to the Card Game API")
+})
 //importing the cards route with mddileare verfication 
 //this how we know which api its and whatver api req start with cardsApi that move 
 app.use('/cardsApi',cards)
