@@ -12,10 +12,7 @@ const app = express();
 connectDB();
 //parssing the incoimg request body as json data in to the javascript object
 app.use(bodyparser.json());
-const allowedOrigins = (process.env.CORS_ORIGINS || "")
-  .split(",")
-  .map((origin) => origin.trim())
-  .filter(Boolean);
+const allowedOrigins = ["https://onepice-cardgame-frontend.vercel.app"];
 
 app.use(
   cors({
