@@ -374,6 +374,101 @@ const buildRecommendedCards = (optimizationSuggestions, allCardsByCode) => {
   return recommended;
 };
 
+const buildTargetPlan = ({ archetype, deckSize }) => {
+  const targetsByArchetype = {
+    aggro: {
+      early: Math.round(deckSize * 0.44),
+      mid: Math.round(deckSize * 0.36),
+      late: Math.round(deckSize * 0.2),
+      events: Math.round(deckSize * 0.12),
+      blockers: Math.round(deckSize * 0.12),
+      removal: Math.round(deckSize * 0.12),
+      searchers: Math.round(deckSize * 0.1),
+      finishers: Math.round(deckSize * 0.08),
+    },
+    control: {
+      early: Math.round(deckSize * 0.3),
+      mid: Math.round(deckSize * 0.4),
+      late: Math.round(deckSize * 0.3),
+      events: Math.round(deckSize * 0.2),
+      blockers: Math.round(deckSize * 0.16),
+      removal: Math.round(deckSize * 0.16),
+      searchers: Math.round(deckSize * 0.1),
+      finishers: Math.round(deckSize * 0.12),
+    },
+    midrange: {
+      early: Math.round(deckSize * 0.36),
+      mid: Math.round(deckSize * 0.4),
+      late: Math.round(deckSize * 0.24),
+      events: Math.round(deckSize * 0.16),
+      blockers: Math.round(deckSize * 0.14),
+      removal: Math.round(deckSize * 0.14),
+      searchers: Math.round(deckSize * 0.1),
+      finishers: Math.round(deckSize * 0.1),
+    },
+  };
+
+  return {
+    archetype,
+    deckSize,
+    targets: targetsByArchetype[archetype] || targetsByArchetype.midrange,
+  };
+};
+
+const buildNextBestSwaps = ({ optimizationSuggestions, expandedDeck, allCardsByCode }) => {
+  const addPool = [];
+  for (const suggestion of optimizationSuggestions) {
+    if (suggestion.action !== "add") continue;
+    for (const ref of suggestion.cards || []) {
+      const card = allCardsByCode.get(ref.cardId);
+      if (!card) continue;
+      addPool.push({ ...card, reason: suggestion.reason });
+    }
+  }
+
+  const uniqueAddPool = [];
+  const seenAdd = new Set();
+  for (const card of addPool) {
+    if (seenAdd.has(card.card_code)) continue;
+    seenAdd.add(card.card_code);
+    uniqueAddPool.push(card);
+  }
+
+  const removePool = expandedDeck
+    .filter((card) => card.cost >= 6 || card.counter_value === 0 || card.type === "stage")
+    .sort((a, b) => b.cost - a.cost || a.counter_value - b.counter_value);
+
+  const swaps = [];
+  const usedRemove = new Set();
+  for (const addCard of uniqueAddPool) {
+    const removeCard = removePool.find((candidate) => !usedRemove.has(candidate.card_code));
+    if (!removeCard) break;
+    usedRemove.add(removeCard.card_code);
+
+    const impact = clamp(
+      Math.round(
+        (addCard.counter_value > removeCard.counter_value ? 18 : 0) +
+          (addCard.cost <= 3 && removeCard.cost >= 6 ? 20 : 0) +
+          (detectCardRoles(addCard).includes("removal") ? 15 : 0) +
+          (detectCardRoles(addCard).includes("blocker") ? 15 : 0) +
+          25
+      ),
+      1,
+      100
+    );
+
+    swaps.push({
+      remove: { cardName: removeCard.name, cardId: removeCard.card_code },
+      add: { cardName: addCard.name, cardId: addCard.card_code },
+      reason: addCard.reason,
+      expectedImpact: impact,
+    });
+    if (swaps.length >= 10) break;
+  }
+
+  return swaps;
+};
+
 const optimizeDeck = async (req, res) => {
   try {
     const leader = req.body?.leader || null;
@@ -391,7 +486,8 @@ const optimizeDeck = async (req, res) => {
     // Build deck from provided full decklist first; fallback to DB lookup by id.
     const expandedDeck = [];
     for (const item of deckItems) {
-      const sourceCard = item.card && item.card.card_code ? item.card : allCardsByCode.get(item.card_code);
+      const providedCardLooksComplete = Boolean(item.card && item.card.card_code && item.card.name);
+      const sourceCard = providedCardLooksComplete ? item.card : allCardsByCode.get(item.card_code);
       if (!sourceCard) continue;
       const card = toInternalCard(sourceCard);
       for (let i = 0; i < item.count; i += 1) expandedDeck.push(card);
@@ -405,6 +501,18 @@ const optimizeDeck = async (req, res) => {
     const weaknesses = findWeaknesses({ roleBreakdown, costCurve, expandedDeck });
 
     const leaderColor = normalizeText(leader?.color || "");
+    const removalDensity = expandedDeck.length ? Math.round((roleBreakdown.roleCounts.removal / expandedDeck.length) * 100) : 0;
+    const blockerDensity = expandedDeck.length ? Math.round((roleBreakdown.roleCounts.blockers / expandedDeck.length) * 100) : 0;
+    const archetype = inferArchetype({
+      lowCostDensity: costCurve.phases.earlyGame.percent,
+      avgCost: parseNumber(
+        expandedDeck.length
+          ? expandedDeck.reduce((sum, c) => sum + c.cost, 0) / expandedDeck.length
+          : 0
+      ),
+      removalDensity,
+      blockerDensity,
+    });
     const optimizationSuggestions = buildOptimizationSuggestions({
       weaknesses,
       expandedDeck,
@@ -412,6 +520,8 @@ const optimizeDeck = async (req, res) => {
       leaderColor,
     });
     const recommendedCards = buildRecommendedCards(optimizationSuggestions, allCardsByCode);
+    const targetPlan = buildTargetPlan({ archetype, deckSize: Math.max(deckSize, expandedDeck.length || 50) });
+    const nextBestSwaps = buildNextBestSwaps({ optimizationSuggestions, expandedDeck, allCardsByCode });
 
     // Backward-compat suggestions for existing deck builder widget
     const suggestions = optimizationSuggestions.map((item) => ({
@@ -439,7 +549,9 @@ const optimizeDeck = async (req, res) => {
       consistencyScore,
       metaFitScore,
       weaknesses,
+      targetPlan,
       optimizationSuggestions,
+      nextBestSwaps,
       recommendedCards,
       deck_power: {
         score: deckPowerScore,
@@ -456,4 +568,3 @@ const optimizeDeck = async (req, res) => {
 module.exports = {
   optimizeDeck,
 };
-
