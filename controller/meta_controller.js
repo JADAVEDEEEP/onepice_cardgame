@@ -41,7 +41,7 @@ const daysBetween = (d1, d2) => Math.max(0, Math.floor((d1.getTime() - d2.getTim
 const getBestDeck = async (req, res) => {
   try {
     // Query params read kar rahe hain
-    const { format, date_from, date_to, region, country, min_players } = req.query;
+    const { format, date_from, date_to, region, country, min_players, limit } = req.query;
     // min_players ko safe number me parse kiya
     const minPlayers = parseNumber(min_players, 0);
 
@@ -254,6 +254,9 @@ const getBestDeck = async (req, res) => {
       // null entries hatao
       .filter(Boolean);
 
+    const parsedLimit = String(limit || "").toLowerCase() === "all" ? null : parseNumber(limit, 10);
+    const safeLimit = parsedLimit && parsedLimit > 0 ? parsedLimit : 10;
+
     // Final response object
     const response = {
       filters: {
@@ -271,6 +274,7 @@ const getBestDeck = async (req, res) => {
       },
       overall_best_deck: rankedDecks[0] || null,
       best_by_format: bestByFormat,
+      ranked_decks: parsedLimit === null ? rankedDecks : rankedDecks.slice(0, safeLimit),
       top_10_ranked_decks: rankedDecks.slice(0, 10),
       generated_at: new Date().toISOString(),
     };
