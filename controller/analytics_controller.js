@@ -686,7 +686,11 @@ const generateBestDeck = async (req, res) => {
     const leaders = activeCards.filter((card) => card.color === color && card.type === "leader");
 
     const selectedLeader =
-      leaders.find((l) => normalizeText(l.name).includes(preferredLeader)) ||
+      leaders.find(
+        (l) =>
+          normalizeText(l.name).includes(preferredLeader) ||
+          normalizeText(l.card_code).includes(preferredLeader)
+      ) ||
       leaders.sort((a, b) => b.power - a.power)[0] ||
       null;
 
