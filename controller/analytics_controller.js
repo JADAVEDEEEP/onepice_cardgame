@@ -1,5 +1,8 @@
 const cardsDb = require("../model/cards_db");
+const standingsDb = require("../model/standings_db");
+const tournamentsDb = require("../model/tournaments_db");
 
+// Yeh helper kisi bhi numeric value ko safe number me convert karta hai.
 const parseNumber = (value, fallback = 0) => {
   if (typeof value === "number") return Number.isFinite(value) ? value : fallback;
   if (typeof value === "string") {
@@ -9,10 +12,22 @@ const parseNumber = (value, fallback = 0) => {
   return fallback;
 };
 
+// Yeh helper text ko trim + lowercase me normalize karta hai.
 const normalizeText = (value) => String(value || "").trim().toLowerCase();
+// Yeh helper deck/leader naam match karne ke liye special characters hata deta hai.
+const normalizeNameForMatch = (value) => normalizeText(value).replace(/[^a-z0-9]/g, "");
+// Yeh helper string date ko valid Date object me badalta hai.
+const parseDate = (value) => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+};
+// Yeh helper do dates ke beech days ka gap nikalta hai.
+const daysBetween = (d1, d2) => Math.max(0, Math.floor((d1.getTime() - d2.getTime()) / (1000 * 60 * 60 * 24)));
 
+// Yeh helper score values ko min-max range ke andar rakhta hai.
 const clamp = (value, min = 0, max = 100) => Math.max(min, Math.min(max, value));
 
+// Yeh helper banned/suspended cards ko active pool se filter karta hai.
 const isCardActive = (card) => {
   const status = normalizeText(card?.tournament_status || card?.tournamentStatus || card?.status || card?.legality);
   if (status.includes("banned") || status.includes("forbidden") || status.includes("suspended")) return false;
@@ -20,6 +35,7 @@ const isCardActive = (card) => {
   return true;
 };
 
+// Yeh helper raw card document ko internal analytics format me map karta hai.
 const toInternalCard = (card) => ({
   card_code: String(card.id || card.card_code || "").trim(),
   name: card.name || "Unknown Card",
@@ -35,6 +51,7 @@ const toInternalCard = (card) => ({
   image_url: card.img_full_url || card.img_url || card.image_url || "",
 });
 
+// Yeh helper incoming deck payload ko uniform items list me convert karta hai.
 const normalizeDeckItems = (payload) => {
   if (!payload) return [];
   if (Array.isArray(payload)) {
@@ -60,6 +77,7 @@ const normalizeDeckItems = (payload) => {
   return [];
 };
 
+// Yeh helper card text ke basis par card roles detect karta hai.
 const detectCardRoles = (card) => {
   const text = normalizeText(card.text_effect);
   const roles = new Set();
@@ -78,12 +96,14 @@ const detectCardRoles = (card) => {
   return Array.from(roles);
 };
 
+// Yeh helper deck stats dekh kar archetype infer karta hai.
 const inferArchetype = ({ lowCostDensity, avgCost, removalDensity, blockerDensity }) => {
   if (lowCostDensity >= 45 && avgCost <= 3) return "aggro";
   if (removalDensity >= 18 || blockerDensity >= 14) return "control";
   return "midrange";
 };
 
+// Yeh helper deck ka cost curve distribution aur issues nikalta hai.
 const buildCostCurve = (expandedDeck) => {
   const distribution = {};
   for (let i = 0; i <= 8; i += 1) distribution[String(i)] = 0;
@@ -130,6 +150,7 @@ const buildCostCurve = (expandedDeck) => {
   };
 };
 
+// Yeh helper deck ka type/role breakdown calculate karta hai.
 const computeRoleBreakdown = (expandedDeck) => {
   const typeCounts = { characters: 0, events: 0, stages: 0 };
   const roleCounts = { blockers: 0, removal: 0, searchers: 0, finishers: 0, draw: 0, boardControl: 0 };
@@ -157,6 +178,7 @@ const computeRoleBreakdown = (expandedDeck) => {
   return { typeCounts, roleCounts, missingRoles };
 };
 
+// Yeh helper leader ke against deck synergy score calculate karta hai.
 const computeSynergy = (expandedDeck, leader) => {
   const total = expandedDeck.length || 1;
   const leaderColor = normalizeText(leader?.color);
@@ -190,6 +212,7 @@ const computeSynergy = (expandedDeck, leader) => {
   };
 };
 
+// Yeh helper deck consistency score aur ratio issues return karta hai.
 const computeConsistency = ({ expandedDeck, costCurve, roleBreakdown }) => {
   const total = expandedDeck.length || 1;
   const searchCards = roleBreakdown.roleCounts.searchers;
@@ -218,6 +241,7 @@ const computeConsistency = ({ expandedDeck, costCurve, roleBreakdown }) => {
   };
 };
 
+// Yeh helper common meta leaders ke against estimated fit score banata hai.
 const computeMetaFit = ({ leader, roleBreakdown, costCurve, consistencyScore }) => {
   const metaLeaders = [
     { leader: "Red Aggro", color: "red", style: "rush" },
@@ -258,6 +282,7 @@ const computeMetaFit = ({ leader, roleBreakdown, costCurve, consistencyScore }) 
   return { score: clamp(overall), byLeader };
 };
 
+// Yeh helper deck ki major weaknesses list banata hai.
 const findWeaknesses = ({ roleBreakdown, costCurve, expandedDeck }) => {
   const weaknesses = [];
   const total = expandedDeck.length || 1;
@@ -281,6 +306,7 @@ const findWeaknesses = ({ roleBreakdown, costCurve, expandedDeck }) => {
   return weaknesses;
 };
 
+// Yeh helper weaknesses ke hisaab se add/remove suggestions banata hai.
 const buildOptimizationSuggestions = ({ weaknesses, expandedDeck, allCards, leaderColor }) => {
   const deckCountMap = new Map();
   for (const card of expandedDeck) {
@@ -349,6 +375,7 @@ const buildOptimizationSuggestions = ({ weaknesses, expandedDeck, allCards, lead
   return suggestions;
 };
 
+// Yeh helper suggestions se recommended cards ka compact list banata hai.
 const buildRecommendedCards = (optimizationSuggestions, allCardsByCode) => {
   const seen = new Set();
   const recommended = [];
@@ -374,6 +401,7 @@ const buildRecommendedCards = (optimizationSuggestions, allCardsByCode) => {
   return recommended;
 };
 
+// Yeh helper card ko current generation context ke hisaab se score deta hai.
 const scoreCardForDeck = (card, context) => {
   const roles = detectCardRoles(card);
   const playstyle = context.playstyle || "balanced";
@@ -421,6 +449,7 @@ const scoreCardForDeck = (card, context) => {
   return score;
 };
 
+// Yeh helper card ka primary role label choose karta hai.
 const getRoleLabel = (card) => {
   const roles = detectCardRoles(card);
   if (roles.includes("removal")) return "Removal";
@@ -430,6 +459,7 @@ const getRoleLabel = (card) => {
   return "Engine";
 };
 
+// Yeh helper scored pool se target-based generated deck banata hai.
 const generateDeckFromPool = ({ pool, deckSize, playstyle, riskMode, metaContext }) => {
   const scored = pool
     .map((card) => ({
@@ -500,6 +530,7 @@ const generateDeckFromPool = ({ pool, deckSize, playstyle, riskMode, metaContext
   return { deckCards, total };
 };
 
+// Yeh helper available cards se color-wise high-level stats banata hai.
 const buildBestColorStats = (cards) => {
   const colors = ["red", "blue", "green", "purple", "black", "yellow"];
   const matchupBase = {
@@ -551,6 +582,7 @@ const buildBestColorStats = (cards) => {
   return rows.sort((a, b) => b.win_rate - a.win_rate);
 };
 
+// Yeh helper archetype ke hisaab se ideal target plan create karta hai.
 const buildTargetPlan = ({ archetype, deckSize }) => {
   const targetsByArchetype = {
     aggro: {
@@ -592,6 +624,7 @@ const buildTargetPlan = ({ archetype, deckSize }) => {
   };
 };
 
+// Yeh helper optimization suggestions se practical card swap pairs banata hai.
 const buildNextBestSwaps = ({ optimizationSuggestions, expandedDeck, allCardsByCode }) => {
   const addPool = [];
   for (const suggestion of optimizationSuggestions) {
@@ -646,6 +679,117 @@ const buildNextBestSwaps = ({ optimizationSuggestions, expandedDeck, allCardsByC
   return swaps;
 };
 
+// Yeh helper deck performance ke basis par matchup matrix score estimate karta hai.
+const estimateDeckVsDeck = (deckA, deckB) => {
+  if (deckA.deck === deckB.deck) return 50;
+
+  const winDelta = (deckA.win_rate_estimate - deckB.win_rate_estimate) * 0.65;
+  const top8Delta = (deckA.top8_rate - deckB.top8_rate) * 0.3;
+  const placementDelta = ((deckB.avg_placement || 20) - (deckA.avg_placement || 20)) * 0.9;
+  const confidenceAdjust = Math.min(4, Math.log2(Math.max(1, Math.min(deckA.entries, deckB.entries))));
+
+  return clamp(Math.round(50 + winDelta + top8Delta + placementDelta + confidenceAdjust), 20, 80);
+};
+
+// Yeh helper standings data ko matrix-friendly ranked deck stats me convert karta hai.
+const buildDeckStatsFromStandings = (standings) => {
+  const byDeck = new Map();
+
+  for (const row of standings) {
+    const deck = String(row.deck || "").trim();
+    const placement = parseNumber(row.placement, Number.MAX_SAFE_INTEGER);
+    if (!deck || !Number.isFinite(placement) || placement <= 0) continue;
+
+    if (!byDeck.has(deck)) {
+      byDeck.set(deck, {
+        deck,
+        entries: 0,
+        wins: 0,
+        top8: 0,
+        placement_sum: 0,
+      });
+    }
+
+    const ref = byDeck.get(deck);
+    ref.entries += 1;
+    ref.wins += placement === 1 ? 1 : 0;
+    ref.top8 += placement <= 8 ? 1 : 0;
+    ref.placement_sum += placement;
+  }
+
+  return Array.from(byDeck.values())
+    .map((item) => ({
+      deck: item.deck,
+      entries: item.entries,
+      wins: item.wins,
+      top8: item.top8,
+      win_rate_estimate: Number(((item.wins / item.entries) * 100).toFixed(1)),
+      top8_rate: Number(((item.top8 / item.entries) * 100).toFixed(1)),
+      avg_placement: Number((item.placement_sum / item.entries).toFixed(2)),
+    }))
+    .sort((a, b) => {
+      const scoreA = a.win_rate_estimate * 0.5 + a.top8_rate * 0.35 + (100 - a.avg_placement * 4) * 0.15;
+      const scoreB = b.win_rate_estimate * 0.5 + b.top8_rate * 0.35 + (100 - b.avg_placement * 4) * 0.15;
+      return scoreB - scoreA;
+    });
+};
+
+// Yeh endpoint matchup matrix ke liye dynamic deck-vs-deck grid return karta hai.
+const getMatchupMatrix = async (req, res) => {
+  try {
+    const format = normalizeText(req.query?.format || req.body?.format || "");
+    const limitRaw = req.query?.limit || req.body?.limit;
+    const dateFrom = req.query?.date_from || req.body?.date_from || null;
+    const dateTo = req.query?.date_to || req.body?.date_to || null;
+
+    const parsedLimit = parseNumber(limitRaw, 8);
+    const limit = clamp(parsedLimit, 4, 12);
+
+    const standingsQuery = {};
+    if (format && format !== "all") standingsQuery.format = format;
+    if (dateFrom || dateTo) {
+      standingsQuery.date = {};
+      if (dateFrom) standingsQuery.date.$gte = dateFrom;
+      if (dateTo) standingsQuery.date.$lte = dateTo;
+    }
+
+    const standings = await standingsDb.find(standingsQuery).lean();
+    const rankedDecks = buildDeckStatsFromStandings(standings).slice(0, limit);
+    const rows = rankedDecks.map((d) => d.deck);
+    const cols = rankedDecks.map((d) => d.deck);
+
+    const deckByName = new Map(rankedDecks.map((d) => [d.deck, d]));
+    const cells = [];
+    for (const row of rows) {
+      for (const col of cols) {
+        const a = deckByName.get(row);
+        const b = deckByName.get(col);
+        if (!a || !b) continue;
+        const value = estimateDeckVsDeck(a, b);
+        const sampleSize = Math.max(1, Math.round(Math.min(a.entries, b.entries) * 1.8));
+        cells.push({ row, col, value, sampleSize });
+      }
+    }
+
+    return res.json({
+      filters: {
+        format: format || "all",
+        date_from: dateFrom,
+        date_to: dateTo,
+        limit,
+      },
+      rows,
+      cols,
+      cells,
+      decks: rankedDecks,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to build matchup matrix", error: error.message });
+  }
+};
+
+// Yeh endpoint best color finder ke liye analytics response return karta hai.
 const bestColorFinder = async (req, res) => {
   try {
     const cardsRaw = await cardsDb.find({}).lean();
@@ -671,6 +815,7 @@ const bestColorFinder = async (req, res) => {
   }
 };
 
+// Yeh endpoint selected inputs ke basis par best deck generate karta hai.
 const generateBestDeck = async (req, res) => {
   try {
     const color = normalizeText(req.body?.color || "red");
@@ -777,6 +922,7 @@ const generateBestDeck = async (req, res) => {
   }
 };
 
+// Yeh endpoint provided decklist ko analyze karke optimization output deta hai.
 const optimizeDeck = async (req, res) => {
   try {
     const leader = req.body?.leader || null;
@@ -874,6 +1020,7 @@ const optimizeDeck = async (req, res) => {
 };
 
 module.exports = {
+  getMatchupMatrix,
   bestColorFinder,
   generateBestDeck,
   optimizeDeck,
