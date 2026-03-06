@@ -1,6 +1,7 @@
 const cardsDb = require("../model/cards_db");
 const standingsDb = require("../model/standings_db");
 const tournamentsDb = require("../model/tournaments_db");
+const savedDeckDb = require("../model/saved_decks_db");
 
 // Yeh helper kisi bhi numeric value ko safe number me convert karta hai.
 const parseNumber = (value, fallback = 0) => {
@@ -26,6 +27,24 @@ const daysBetween = (d1, d2) => Math.max(0, Math.floor((d1.getTime() - d2.getTim
 
 // Yeh helper score values ko min-max range ke andar rakhta hai.
 const clamp = (value, min = 0, max = 100) => Math.max(min, Math.min(max, value));
+const analyticsCache = new Map();
+const ANALYTICS_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_CACHE_TTL_MS, 60_000));
+
+// Yeh helper cached response return karta hai agar key valid TTL ke andar hai.
+const getCachedResponse = (key) => {
+  const hit = analyticsCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.ts > ANALYTICS_CACHE_TTL_MS) {
+    analyticsCache.delete(key);
+    return null;
+  }
+  return hit.value;
+};
+
+// Yeh helper response ko cache me store karta hai.
+const setCachedResponse = (key, value) => {
+  analyticsCache.set(key, { ts: Date.now(), value });
+};
 
 // Yeh helper banned/suspended cards ko active pool se filter karta hai.
 const isCardActive = (card) => {
@@ -950,16 +969,88 @@ const buildDeckStatsFromStandings = (standings) => {
     });
 };
 
+// Yeh helper saved deck document se deck cards ko alag-alag schema variants se nikalta hai.
+const normalizeSavedDeckCards = (savedDeck) => {
+  const rawItems = Array.isArray(savedDeck?.deck_cards)
+    ? savedDeck.deck_cards
+    : Array.isArray(savedDeck?.decklist)
+    ? savedDeck.decklist
+    : Array.isArray(savedDeck?.deckCards)
+    ? savedDeck.deckCards
+    : [];
+
+  return rawItems
+    .map((item) => ({
+      card_code: String(item?.card_code || item?.code || item?.id || "").trim(),
+      count: parseNumber(item?.count ?? item?.qty ?? item?.quantity ?? item?.copies, 0),
+    }))
+    .filter((item) => item.card_code && item.count > 0);
+};
+
+// Yeh helper saved deck ko matrix/compare compatible pseudo-meta stats me convert karta hai.
+const buildDeckStatFromSavedDeck = ({ savedDeck, cardsByCode }) => {
+  const expanded = [];
+  const normalizedItems = normalizeSavedDeckCards(savedDeck);
+  for (const item of normalizedItems) {
+    const code = String(item?.card_code || "").trim();
+    const count = parseNumber(item?.count, 0);
+    const card = cardsByCode.get(code);
+    if (!card || count <= 0) continue;
+    for (let i = 0; i < count; i += 1) expanded.push(card);
+  }
+
+  const total = expanded.length || 1;
+  const counterDensity = Math.round((expanded.filter((c) => c.counter_value > 0).length / total) * 100);
+  const lowCurve = Math.round((expanded.filter((c) => c.cost <= 3).length / total) * 100);
+  const blockers = expanded.filter((c) => detectCardRoles(c).includes("blocker")).length;
+  const removal = expanded.filter((c) => detectCardRoles(c).includes("removal")).length;
+  const avgPlacementProxy = clamp(16 - (lowCurve * 0.06 + counterDensity * 0.04 + blockers * 0.08 + removal * 0.05), 2, 20);
+
+  const winRate = clamp(40 + lowCurve * 0.14 + counterDensity * 0.08 + blockers * 0.25 + removal * 0.18, 35, 72);
+  const top8 = clamp(22 + lowCurve * 0.12 + counterDensity * 0.1 + blockers * 0.35, 18, 70);
+  const entries = 12;
+  const wins = Math.max(1, Math.round((winRate / 100) * entries));
+  const top8Count = Math.max(1, Math.round((top8 / 100) * entries));
+
+  return {
+    deck: savedDeck.deck_name,
+    entries,
+    wins,
+    top8: top8Count,
+    win_rate_estimate: Number(winRate.toFixed(1)),
+    top8_rate: Number(top8.toFixed(1)),
+    avg_placement: Number(avgPlacementProxy.toFixed(2)),
+    is_custom: true,
+    saved_deck_id: String(savedDeck._id),
+  };
+};
+
 // Yeh endpoint matchup matrix ke liye dynamic deck-vs-deck grid return karta hai.
 const getMatchupMatrix = async (req, res) => {
   try {
     const format = normalizeText(req.query?.format || req.body?.format || "");
     const limitRaw = req.query?.limit || req.body?.limit;
+    const pageRaw = req.query?.page || req.body?.page;
     const dateFrom = req.query?.date_from || req.body?.date_from || null;
     const dateTo = req.query?.date_to || req.body?.date_to || null;
+    const savedDeckId = String(req.query?.saved_deck_id || req.body?.saved_deck_id || "").trim();
+    const deckQuery = normalizeText(req.query?.deck_query || req.body?.deck_query || "");
 
     const parsedLimit = parseNumber(limitRaw, 8);
-    const limit = clamp(parsedLimit, 4, 12);
+    const limit = clamp(parsedLimit, 4, 30);
+    const page = Math.max(1, parseNumber(pageRaw, 1));
+
+    const cacheKey = JSON.stringify({
+      format: format || "all",
+      limit,
+      page,
+      dateFrom: dateFrom || null,
+      dateTo: dateTo || null,
+      savedDeckId: savedDeckId || null,
+      deckQuery: deckQuery || null,
+    });
+    const cached = getCachedResponse(cacheKey);
+    if (cached) return res.json({ ...cached, cache: "hit" });
 
     const standingsQuery = {};
     if (format && format !== "all") standingsQuery.format = format;
@@ -969,12 +1060,37 @@ const getMatchupMatrix = async (req, res) => {
       if (dateTo) standingsQuery.date.$lte = dateTo;
     }
 
-    const standings = await standingsDb.find(standingsQuery).lean();
-    const rankedDecks = buildDeckStatsFromStandings(standings).slice(0, limit);
-    const rows = rankedDecks.map((d) => d.deck);
-    const cols = rankedDecks.map((d) => d.deck);
+    const [standings, cardsRaw] = await Promise.all([
+      standingsDb.find(standingsQuery).lean(),
+      cardsDb.find({}).lean(),
+    ]);
+    const cardsByCode = new Map(
+      cardsRaw.filter(isCardActive).map(toInternalCard).map((card) => [card.card_code, card])
+    );
 
-    const deckByName = new Map(rankedDecks.map((d) => [d.deck, d]));
+    let rankedDecks = buildDeckStatsFromStandings(standings);
+
+    if (deckQuery) {
+      rankedDecks = rankedDecks.filter((row) => normalizeText(row.deck).includes(deckQuery));
+    }
+
+    const totalDecks = rankedDecks.length;
+    const skip = (page - 1) * limit;
+    rankedDecks = rankedDecks.slice(skip, skip + limit);
+
+    if (savedDeckId) {
+      const savedDeck = await savedDeckDb.findById(savedDeckId).lean();
+      if (savedDeck) {
+        const customDeckStat = buildDeckStatFromSavedDeck({ savedDeck, cardsByCode });
+        rankedDecks.unshift(customDeckStat);
+      }
+    }
+
+    const uniqueByDeck = Array.from(new Map(rankedDecks.map((d) => [d.deck, d])).values());
+    const rows = uniqueByDeck.map((d) => d.deck);
+    const cols = uniqueByDeck.map((d) => d.deck);
+
+    const deckByName = new Map(uniqueByDeck.map((d) => [d.deck, d]));
     const cells = [];
     for (const row of rows) {
       for (const col of cols) {
@@ -987,21 +1103,67 @@ const getMatchupMatrix = async (req, res) => {
       }
     }
 
-    return res.json({
+    const response = {
       filters: {
         format: format || "all",
         date_from: dateFrom,
         date_to: dateTo,
+        deck_query: deckQuery || null,
         limit,
+        page,
+      },
+      pagination: {
+        total_decks: totalDecks,
+        total_pages: Math.max(1, Math.ceil(totalDecks / limit)),
+        has_next: skip + limit < totalDecks,
+        has_prev: page > 1,
       },
       rows,
       cols,
       cells,
-      decks: rankedDecks,
+      decks: uniqueByDeck,
+      generated_at: new Date().toISOString(),
+      cache: "miss",
+    };
+    setCachedResponse(cacheKey, response);
+    return res.json(response);
+  } catch (error) {
+    return res.status(500).json({ message: "Failed to build matchup matrix", error: error.message });
+  }
+};
+
+// Yeh endpoint saved deck ko compare-friendly summary profile me return karta hai.
+const getSavedDeckProfile = async (req, res) => {
+  try {
+    const deckId = String(req.params?.deckId || "").trim();
+    if (!deckId) return res.status(400).json({ message: "deckId is required" });
+
+    const [savedDeck, cardsRaw] = await Promise.all([
+      savedDeckDb.findById(deckId).lean(),
+      cardsDb.find({}).lean(),
+    ]);
+    if (!savedDeck) return res.status(404).json({ message: "Saved deck not found" });
+
+    const cardsByCode = new Map(cardsRaw.filter(isCardActive).map(toInternalCard).map((c) => [c.card_code, c]));
+    const stat = buildDeckStatFromSavedDeck({ savedDeck, cardsByCode });
+
+    return res.json({
+      deck: savedDeck.deck_name,
+      summary: {
+        entries: stat.entries,
+        wins: stat.wins,
+        top8: stat.top8,
+        win_rate_estimate: stat.win_rate_estimate,
+        top8_rate: stat.top8_rate,
+        avg_placement: stat.avg_placement,
+        tournaments_covered: stat.entries,
+      },
+      saved_deck_id: String(savedDeck._id),
+      is_custom: true,
       generated_at: new Date().toISOString(),
     });
   } catch (error) {
-    return res.status(500).json({ message: "Failed to build matchup matrix", error: error.message });
+    return res.status(500).json({ message: "Failed to build saved deck profile", error: error.message });
   }
 };
 
@@ -1290,6 +1452,7 @@ const optimizeDeck = async (req, res) => {
 
 module.exports = {
   getMatchupMatrix,
+  getSavedDeckProfile,
   bestColorFinder,
   generateBestDeck,
   optimizeDeck,
