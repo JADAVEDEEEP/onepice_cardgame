@@ -2,6 +2,7 @@ const cardsDb = require("../model/cards_db");
 const standingsDb = require("../model/standings_db");
 const tournamentsDb = require("../model/tournaments_db");
 const savedDeckDb = require("../model/saved_decks_db");
+const mongoose = require("mongoose");
 
 // Yeh helper kisi bhi numeric value ko safe number me convert karta hai.
 const parseNumber = (value, fallback = 0) => {
@@ -1078,7 +1079,7 @@ const getMatchupMatrix = async (req, res) => {
     const skip = (page - 1) * limit;
     rankedDecks = rankedDecks.slice(skip, skip + limit);
 
-    if (savedDeckId) {
+    if (savedDeckId && mongoose.Types.ObjectId.isValid(savedDeckId)) {
       const savedDeck = await savedDeckDb.findById(savedDeckId).lean();
       if (savedDeck) {
         const customDeckStat = buildDeckStatFromSavedDeck({ savedDeck, cardsByCode });
