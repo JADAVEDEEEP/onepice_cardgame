@@ -1083,6 +1083,10 @@ const getMatchupMatrix = async (req, res) => {
       const savedDeck = await savedDeckDb.findById(savedDeckId).lean();
       if (savedDeck) {
         const customDeckStat = buildDeckStatFromSavedDeck({ savedDeck, cardsByCode });
+        const hasNameConflict = rankedDecks.some((deck) => deck.deck === customDeckStat.deck);
+        if (hasNameConflict) {
+          customDeckStat.deck = `${customDeckStat.deck} (Your Deck)`;
+        }
         rankedDecks.unshift(customDeckStat);
       }
     }
