@@ -530,8 +530,8 @@ const generateDeckFromPool = ({ pool, deckSize, playstyle, riskMode, metaContext
   return { deckCards, total };
 };
 
-// Yeh helper available cards se color-wise high-level stats banata hai.
-const buildBestColorStats = (cards) => {
+// Yeh helper card pool fallback se color-wise high-level stats banata hai.
+const buildBestColorStatsFromCards = (cards) => {
   const colors = ["red", "blue", "green", "purple", "black", "yellow"];
   const matchupBase = {
     red: { bad: 2, fit: 64 },
@@ -580,6 +580,222 @@ const buildBestColorStats = (cards) => {
   });
 
   return rows.sort((a, b) => b.win_rate - a.win_rate);
+};
+
+// Yeh helper standings ke deck naam se possible color infer karta hai.
+const inferColorFromDeckName = (deckName, leaderNameIndex) => {
+  const text = normalizeNameForMatch(deckName);
+  if (!text) return null;
+
+  if (text.includes("red")) return "red";
+  if (text.includes("blue")) return "blue";
+  if (text.includes("green")) return "green";
+  if (text.includes("purple")) return "purple";
+  if (text.includes("black")) return "black";
+  if (text.includes("yellow")) return "yellow";
+
+  for (const [leaderName, color] of leaderNameIndex.entries()) {
+    if (leaderName && text.includes(leaderName)) return color;
+  }
+
+  return null;
+};
+
+// Yeh helper leader name ke aliases bana kar color inference strong karta hai.
+const buildLeaderAliasIndex = (leaderCards) => {
+  const aliasToColor = new Map();
+  const addAlias = (alias, color) => {
+    const key = normalizeNameForMatch(alias);
+    if (!key || key.length < 3) return;
+    if (!aliasToColor.has(key)) aliasToColor.set(key, color);
+  };
+
+  for (const leader of leaderCards) {
+    addAlias(leader.name, leader.color);
+    addAlias(leader.card_code, leader.color);
+
+    const baseName = String(leader.name || "")
+      .replace(/[{}()[\]."']/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const parts = baseName.split(" ").filter(Boolean);
+    for (const part of parts) addAlias(part, leader.color);
+
+    if (parts.length >= 2) {
+      addAlias(parts.slice(-2).join(" "), leader.color);
+      addAlias(parts[parts.length - 1], leader.color);
+    }
+  }
+
+  return aliasToColor;
+};
+
+// Yeh helper meta standings + tournaments se filter-aware color stats nikalta hai.
+const buildBestColorStatsFromMeta = ({ standings, tournaments, cards, playstyle, budgetMode, metaWeight }) => {
+  const colors = ["red", "blue", "green", "purple", "black", "yellow"];
+  const leaderCards = cards.filter((card) => card.type === "leader" && colors.includes(card.color));
+
+  const leaderNameToColor = new Map();
+  const leadersByColor = new Map(colors.map((color) => [color, []]));
+  for (const leader of leaderCards) {
+    const key = normalizeNameForMatch(leader.name);
+    if (key) leaderNameToColor.set(key, leader.color);
+    leadersByColor.get(leader.color)?.push(leader.card_code);
+  }
+  const leaderAliasToColor = buildLeaderAliasIndex(leaderCards);
+  const leaderCodeToColor = new Map(leaderCards.map((leader) => [normalizeText(leader.card_code), leader.color]));
+
+  const tournamentByName = new Map();
+  const tournamentByNameFormat = new Map();
+  for (const t of tournaments) {
+    const nameKey = normalizeText(t.name);
+    const formatKey = normalizeText(t.format);
+    if (nameKey) tournamentByName.set(nameKey, t);
+    if (nameKey && formatKey) tournamentByNameFormat.set(`${nameKey}|${formatKey}`, t);
+  }
+
+  const now = new Date();
+  const byColor = new Map(colors.map((color) => [color, { entries: 0, wins: 0, top8: 0, placementSum: 0, weightedScore: 0 }]));
+  let usedRows = 0;
+
+  for (const row of standings) {
+    const deckName = String(row.deck || "").trim();
+    const placement = parseNumber(row.placement, Number.MAX_SAFE_INTEGER);
+    if (!deckName || !Number.isFinite(placement) || placement <= 0) continue;
+
+    let inferredColor = inferColorFromDeckName(deckName, leaderNameToColor);
+    if (!inferredColor) inferredColor = inferColorFromDeckName(deckName, leaderAliasToColor);
+    if (!inferredColor) {
+      const leaderImage = String(row.leaderImage || "");
+      const codeMatch = leaderImage.match(/([A-Z]{1,3}\d{2}-\d{3}[A-Z0-9_-]*)/i);
+      const codeKey = normalizeText(codeMatch?.[1] || "");
+      if (codeKey && leaderCodeToColor.has(codeKey)) inferredColor = leaderCodeToColor.get(codeKey);
+    }
+    if (!inferredColor) continue;
+
+    const tName = normalizeText(row.tournament);
+    const tFormat = normalizeText(row.format);
+    const tournament = tournamentByNameFormat.get(`${tName}|${tFormat}`) || tournamentByName.get(tName);
+    const players = parseNumber(tournament?.players, 64);
+    const resultDate = parseDate(row.date || tournament?.date);
+    const ageDays = resultDate ? daysBetween(now, resultDate) : 365;
+
+    const placementWeight = 1 / placement;
+    const sizeWeight = Math.log10(players + 1);
+    const recencyWeight = Math.exp(-ageDays / 365);
+    const styleWeight =
+      playstyle === "aggro"
+        ? placement <= 8
+          ? 1.08
+          : 1
+        : playstyle === "control"
+        ? placement <= 16
+          ? 1.05
+          : 1
+        : 1;
+    const budgetWeight = budgetMode ? (players <= 200 ? 1.08 : 0.96) : 1;
+    const score = placementWeight * sizeWeight * recencyWeight * styleWeight * budgetWeight * 100;
+
+    const ref = byColor.get(inferredColor);
+    ref.entries += 1;
+    ref.wins += placement === 1 ? 1 : 0;
+    ref.top8 += placement <= 8 ? 1 : 0;
+    ref.placementSum += placement;
+    ref.weightedScore += score;
+    usedRows += 1;
+  }
+
+  const totalEntries = Array.from(byColor.values()).reduce((sum, row) => sum + row.entries, 0);
+  if (usedRows === 0 || totalEntries === 0) {
+    return { colorStats: buildBestColorStatsFromCards(cards), usedRows: 0 };
+  }
+
+  const weightedAverages = colors.map((color) => {
+    const ref = byColor.get(color);
+    return ref.entries ? ref.weightedScore / ref.entries : 0;
+  });
+  const minWeighted = Math.min(...weightedAverages);
+  const maxWeighted = Math.max(...weightedAverages);
+  const weightedSpan = Math.max(0.001, maxWeighted - minWeighted);
+  const avgPickRate = totalEntries / colors.length;
+
+  const playstyleBias = {
+    aggro: { red: 3, purple: 1.5, yellow: 1, green: 0.5, black: -1, blue: -2 },
+    control: { blue: 3, black: 2, yellow: 1, purple: 0.5, green: -1, red: -2 },
+    midrange: { green: 2, black: 1.2, blue: 1, red: 1, purple: 0.8, yellow: 0.2 },
+  };
+  const budgetBias = { red: 2, green: 1.5, purple: 0.8, black: 0.5, blue: -0.7, yellow: -1 };
+
+  const rows = colors.map((color) => {
+    const ref = byColor.get(color);
+    const entries = ref.entries;
+    const pickRate = totalEntries ? Number(((entries / totalEntries) * 100).toFixed(1)) : 0;
+    const rawWinRate = entries ? Number(((ref.wins / entries) * 100).toFixed(1)) : 0;
+    const top8Rate = entries ? Number(((ref.top8 / entries) * 100).toFixed(1)) : 0;
+    const avgPlacement = entries ? Number((ref.placementSum / entries).toFixed(2)) : 99;
+    const confidenceScore = clamp(Math.round(Math.log2(entries + 1) * 18), 5, 100);
+    const weightedAvg = entries ? ref.weightedScore / entries : 0;
+    const weightedNorm = (weightedAvg - minWeighted) / weightedSpan; // 0..1
+
+    const styleBoost = playstyleBias[playstyle]?.[color] || 0;
+    const budgetBoost = budgetMode ? budgetBias[color] || 0 : 0;
+    const safeBoost = metaWeight === "safe" ? confidenceScore * 0.06 + (entries / avgPickRate) * 2.2 : 0;
+    const counterBoost = metaWeight === "counter" ? ((entries < avgPickRate ? 3.5 : -2) + (50 - pickRate) * 0.04) : 0;
+    const balancedBoost = metaWeight === "balanced" ? 0.8 : 0;
+
+    // Win-rate ko weighted performance + top-cut trend + filters ke saath smooth kiya gaya hai.
+    const winRate = clamp(
+      Math.round(
+        42 +
+          weightedNorm * 18 +
+          top8Rate * 0.08 +
+          rawWinRate * 0.12 +
+          styleBoost +
+          budgetBoost +
+          (metaWeight === "safe" ? 1.5 : metaWeight === "counter" ? -0.5 : 0)
+      ),
+      35,
+      75
+    );
+
+    const consistency = clamp(Math.round(top8Rate * 0.45 + confidenceScore * 0.5 + (metaWeight === "safe" ? 4 : 0)));
+    const metaFit = clamp(
+      Math.round(
+        46 +
+          weightedNorm * 22 +
+          top8Rate * 0.18 +
+          styleBoost * 2 +
+          budgetBoost * 1.5 +
+          safeBoost +
+          counterBoost +
+          balancedBoost
+      )
+    );
+    const badMatchups =
+      winRate >= 60 ? 1 : winRate >= 55 ? 2 : winRate >= 50 ? 3 : 4;
+    const finalRankScore = winRate * 0.52 + metaFit * 0.3 + consistency * 0.18;
+
+    return {
+      color,
+      win_rate: winRate,
+      pick_rate: pickRate,
+      bad_matchups_count: badMatchups,
+      consistency,
+      skill_floor: color === "red" || color === "green" ? 6 : 7,
+      skill_ceiling: color === "blue" || color === "yellow" ? 10 : 9,
+      top_leaders: (leadersByColor.get(color) || []).slice(0, 3),
+      meta_fit: metaFit,
+      _rank_score: finalRankScore,
+    };
+  });
+
+  return {
+    colorStats: rows
+      .sort((a, b) => b._rank_score - a._rank_score || b.win_rate - a.win_rate)
+      .map(({ _rank_score, ...row }) => row),
+    usedRows,
+  };
 };
 
 // Yeh helper archetype ke hisaab se ideal target plan create karta hai.
@@ -792,20 +1008,73 @@ const getMatchupMatrix = async (req, res) => {
 // Yeh endpoint best color finder ke liye analytics response return karta hai.
 const bestColorFinder = async (req, res) => {
   try {
-    const cardsRaw = await cardsDb.find({}).lean();
+    const dateWindow = parseNumber(req.body?.dateWindow, 30);
+    const requestedFormat = normalizeText(req.body?.format || "all");
+    const playstyle = normalizeText(req.body?.playstyle || "midrange");
+    const budgetMode = Boolean(req.body?.budgetMode);
+    const metaWeight = normalizeText(req.body?.metaWeight || "balanced");
+
+    const dateFrom = new Date();
+    dateFrom.setDate(dateFrom.getDate() - Math.max(1, dateWindow));
+    const dateFromIso = dateFrom.toISOString().slice(0, 10);
+
+    const standingsQuery = { date: { $gte: dateFromIso } };
+    const tournamentsQuery = { date: { $gte: dateFromIso } };
+
+    // Format sirf tab apply karenge jab actual set-format jaisa ho (e.g., OP14).
+    if (requestedFormat && requestedFormat !== "all" && /^op\d+/i.test(requestedFormat)) {
+      standingsQuery.format = requestedFormat.toUpperCase();
+      tournamentsQuery.format = requestedFormat.toUpperCase();
+    }
+
+    let [cardsRaw, standings, tournaments] = await Promise.all([
+      cardsDb.find({}).lean(),
+      standingsDb.find(standingsQuery).lean(),
+      tournamentsDb.find(tournamentsQuery).lean(),
+    ]);
+
+    // Agar selected window me data na mile to date filter hata kar broader meta try karo.
+    if (standings.length === 0) {
+      const broaderStandingsQuery = {};
+      const broaderTournamentsQuery = {};
+      if (requestedFormat && requestedFormat !== "all" && /^op\d+/i.test(requestedFormat)) {
+        broaderStandingsQuery.format = requestedFormat.toUpperCase();
+        broaderTournamentsQuery.format = requestedFormat.toUpperCase();
+      }
+      [standings, tournaments] = await Promise.all([
+        standingsDb.find(broaderStandingsQuery).lean(),
+        tournamentsDb.find(broaderTournamentsQuery).lean(),
+      ]);
+    }
+
     const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
-    const colorStats = buildBestColorStats(activeCards);
+    const { colorStats, usedRows } = buildBestColorStatsFromMeta({
+      standings,
+      tournaments,
+      cards: activeCards,
+      playstyle,
+      budgetMode,
+      metaWeight,
+    });
     const topColor = colorStats[0] || null;
 
     return res.json({
       colorStats,
       topRecommendation: topColor,
+      filters: {
+        dateWindow,
+        format: requestedFormat,
+        playstyle,
+        budgetMode,
+        metaWeight,
+      },
+      source: usedRows > 0 ? "standings+tournaments" : "cards-fallback",
       reasons: topColor
         ? [
-            { type: "matchup", text: `Favorable profile with only ${topColor.bad_matchups_count} difficult matchups` },
-            { type: "trend", text: `Meta fit score ${topColor.meta_fit}/100 for current tournament environment` },
-            { type: "consistency", text: `Consistency score ${topColor.consistency}/100 for reliable performance` },
-            { type: "meta", text: `Leader pool available: ${(topColor.top_leaders || []).length} strong options` },
+            { type: "matchup", text: `Estimated ${topColor.bad_matchups_count} difficult matchup lanes in current matrix.` },
+            { type: "trend", text: `Meta fit score ${topColor.meta_fit}/100 from recent ${dateWindow}-day results.` },
+            { type: "consistency", text: `Consistency score ${topColor.consistency}/100 based on top-cut stability.` },
+            { type: "meta", text: `Leader pool available: ${(topColor.top_leaders || []).length} strong options in this color.` },
           ]
         : [],
       generated_at: new Date().toISOString(),
