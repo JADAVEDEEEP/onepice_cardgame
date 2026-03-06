@@ -47,6 +47,76 @@ const setCachedResponse = (key, value) => {
   analyticsCache.set(key, { ts: Date.now(), value });
 };
 
+// Yeh helper standings se top meta leaders nikalta hai (DB-driven, no static list).
+const buildMetaLeaderRowsFromStandings = ({ standings, cards }) => {
+  const leaders = cards.filter((card) => card.type === "leader");
+  const leaderAliasToMeta = new Map();
+  for (const leader of leaders) {
+    const aliases = new Set([
+      normalizeNameForMatch(leader.name),
+      normalizeNameForMatch(leader.card_code),
+      ...String(leader.name || "")
+        .split(/\s+/)
+        .map((p) => normalizeNameForMatch(p))
+        .filter(Boolean),
+    ]);
+    for (const alias of aliases) {
+      if (!alias || alias.length < 3) continue;
+      if (!leaderAliasToMeta.has(alias)) {
+        leaderAliasToMeta.set(alias, {
+          name: leader.name || leader.card_code,
+          color: leader.color || "red",
+          code: leader.card_code,
+        });
+      }
+    }
+  }
+
+  const byLeader = new Map();
+  for (const row of standings || []) {
+    const deckName = normalizeNameForMatch(row.deck || "");
+    if (!deckName) continue;
+    const placement = parseNumber(row.placement, Number.MAX_SAFE_INTEGER);
+    if (!Number.isFinite(placement) || placement <= 0) continue;
+
+    let matched = null;
+    for (const [alias, meta] of leaderAliasToMeta.entries()) {
+      if (deckName.includes(alias)) {
+        matched = meta;
+        break;
+      }
+    }
+    if (!matched) continue;
+
+    const key = matched.code || matched.name;
+    if (!byLeader.has(key)) {
+      byLeader.set(key, {
+        leader: matched.name,
+        color: matched.color,
+        entries: 0,
+        wins: 0,
+        top8: 0,
+        avgPlacementSum: 0,
+      });
+    }
+    const ref = byLeader.get(key);
+    ref.entries += 1;
+    ref.wins += placement === 1 ? 1 : 0;
+    ref.top8 += placement <= 8 ? 1 : 0;
+    ref.avgPlacementSum += placement;
+  }
+
+  return Array.from(byLeader.values())
+    .map((row) => ({
+      ...row,
+      top8Rate: row.entries ? (row.top8 / row.entries) * 100 : 0,
+      winRate: row.entries ? (row.wins / row.entries) * 100 : 0,
+      avgPlacement: row.entries ? row.avgPlacementSum / row.entries : 99,
+    }))
+    .sort((a, b) => b.top8Rate - a.top8Rate || b.entries - a.entries)
+    .slice(0, 6);
+};
+
 // Yeh helper banned/suspended cards ko active pool se filter karta hai.
 const isCardActive = (card) => {
   const status = normalizeText(card?.tournament_status || card?.tournamentStatus || card?.status || card?.legality);
@@ -262,37 +332,26 @@ const computeConsistency = ({ expandedDeck, costCurve, roleBreakdown }) => {
 };
 
 // Yeh helper common meta leaders ke against estimated fit score banata hai.
-const computeMetaFit = ({ leader, roleBreakdown, costCurve, consistencyScore }) => {
-  const metaLeaders = [
-    { leader: "Red Aggro", color: "red", style: "rush" },
-    { leader: "Blue Control", color: "blue", style: "control" },
-    { leader: "Purple Ramp", color: "purple", style: "ramp" },
-    { leader: "Black Midrange", color: "black", style: "midrange" },
-    { leader: "Yellow Value", color: "yellow", style: "tempo" },
-  ];
-
+const computeMetaFit = ({ leader, roleBreakdown, costCurve, consistencyScore, metaLeaders }) => {
   const leaderColor = normalizeText(leader?.color || "red");
   const blockers = roleBreakdown.roleCounts.blockers;
   const removal = roleBreakdown.roleCounts.removal;
   const early = costCurve.phases.earlyGame.percent;
+  const liveMetaLeaders = Array.isArray(metaLeaders) && metaLeaders.length > 0
+    ? metaLeaders
+    : [{ leader: "Open Meta", color: leaderColor || "red", top8Rate: 50, entries: 1, avgPlacement: 8 }];
 
-  const colorMatrix = {
-    red: { red: 50, blue: 46, purple: 54, black: 52, yellow: 56 },
-    blue: { red: 54, blue: 50, purple: 51, black: 49, yellow: 53 },
-    purple: { red: 46, blue: 49, purple: 50, black: 51, yellow: 48 },
-    black: { red: 48, blue: 51, purple: 49, black: 50, yellow: 52 },
-    yellow: { red: 44, blue: 47, purple: 52, black: 48, yellow: 50 },
-    green: { red: 47, blue: 50, purple: 50, black: 49, yellow: 51 },
-  };
-
-  const byLeader = metaLeaders.map((meta) => {
-    const base = colorMatrix[leaderColor]?.[meta.color] ?? 50;
+  const byLeader = liveMetaLeaders.map((meta) => {
+    const colorFit = meta.color === leaderColor ? 3 : -1;
     const roleAdjust = Math.round((blockers >= 8 ? 2 : -2) + (removal >= 8 ? 2 : -2) + (early >= 30 ? 2 : -2));
     const consistencyAdjust = Math.round((consistencyScore.score - 50) * 0.12);
-    const estimatedWinRate = clamp(base + roleAdjust + consistencyAdjust, 20, 80);
+    const metaStrengthAdjust = Math.round(((meta.top8Rate || 50) - 50) * 0.08);
+    const sampleAdjust = Math.round(Math.log2((meta.entries || 1) + 1));
+    const placementAdjust = Math.round((10 - Math.min(10, meta.avgPlacement || 10)) * 0.35);
+    const estimatedWinRate = clamp(50 + colorFit + roleAdjust + consistencyAdjust - metaStrengthAdjust + sampleAdjust + placementAdjust, 20, 80);
 
     return {
-      metaLeader: meta.leader,
+      metaLeader: String(meta.leader || "Meta Leader"),
       estimatedWinRate,
       confidence: estimatedWinRate >= 58 ? "high" : estimatedWinRate >= 50 ? "medium" : "low",
     };
@@ -553,14 +612,6 @@ const generateDeckFromPool = ({ pool, deckSize, playstyle, riskMode, metaContext
 // Yeh helper card pool fallback se color-wise high-level stats banata hai.
 const buildBestColorStatsFromCards = (cards) => {
   const colors = ["red", "blue", "green", "purple", "black", "yellow"];
-  const matchupBase = {
-    red: { bad: 2, fit: 64 },
-    blue: { bad: 2, fit: 61 },
-    green: { bad: 3, fit: 57 },
-    purple: { bad: 2, fit: 60 },
-    black: { bad: 3, fit: 56 },
-    yellow: { bad: 4, fit: 54 },
-  };
 
   const total = cards.length || 1;
   const rows = colors.map((color) => {
@@ -585,17 +636,19 @@ const buildBestColorStatsFromCards = (cards) => {
       35,
       75
     );
+    const metaFit = clamp(Math.round(winRate * 0.55 + consistency * 0.45));
+    const badMatchups = winRate >= 60 ? 1 : winRate >= 55 ? 2 : winRate >= 50 ? 3 : 4;
 
     return {
       color,
       win_rate: winRate,
       pick_rate: pickRate,
-      bad_matchups_count: matchupBase[color].bad,
+      bad_matchups_count: badMatchups,
       consistency,
       skill_floor: color === "red" || color === "green" ? 6 : 7,
       skill_ceiling: color === "blue" || color === "yellow" ? 10 : 9,
       top_leaders: leaders,
-      meta_fit: matchupBase[color].fit,
+      meta_fit: metaFit,
     };
   });
 
@@ -1235,7 +1288,7 @@ const bestColorFinder = async (req, res) => {
         budgetMode,
         metaWeight,
       },
-      source: usedRows > 0 ? "standings+tournaments" : "cards-fallback",
+      source: usedRows > 0 ? "standings+tournaments" : "cards-derived",
       reasons: topColor
         ? [
             { type: "matchup", text: `Estimated ${topColor.bad_matchups_count} difficult matchup lanes in current matrix.` },
@@ -1261,10 +1314,11 @@ const generateBestDeck = async (req, res) => {
     const preferredLeader = normalizeText(req.body?.leader || "");
     const deckSize = clamp(parseNumber(req.body?.deckSize, 50), 40, 60);
 
-    const cardsRaw = await cardsDb.find({}).lean();
+    const [cardsRaw, standingsRaw] = await Promise.all([cardsDb.find({}).lean(), standingsDb.find({}).lean()]);
     const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
     const colorPool = activeCards.filter((card) => card.color === color && card.type !== "leader");
     const leaders = activeCards.filter((card) => card.color === color && card.type === "leader");
+    const metaLeaders = buildMetaLeaderRowsFromStandings({ standings: standingsRaw, cards: activeCards });
 
     const selectedLeader =
       leaders.find(
@@ -1317,20 +1371,19 @@ const generateBestDeck = async (req, res) => {
       return { cost, count };
     });
 
-    const matchupBase = {
-      red: [66, 60, 58, 63, 55],
-      blue: [57, 64, 61, 59, 62],
-      green: [61, 58, 57, 60, 59],
-      purple: [59, 60, 63, 57, 58],
-      black: [58, 59, 60, 62, 56],
-      yellow: [55, 57, 58, 56, 64],
-    };
-
-    const matchupLeaders = ["Red Aggro", "Blue Control", "Purple Ramp", "Black Midrange", "Yellow Value"];
-    const matchupPreview = matchupLeaders.map((leader, idx) => ({
-      leader,
-      winRate: clamp((matchupBase[color] || matchupBase.red)[idx] + Math.round((optimizationScore - 70) * 0.08), 35, 75),
-    }));
+    const liveMatchupLeaders = metaLeaders.length > 0
+      ? metaLeaders
+      : [{ leader: "Open Meta", color, top8Rate: 50, entries: 1, avgPlacement: 8 }];
+    const matchupPreview = liveMatchupLeaders.slice(0, 5).map((meta) => {
+      const colorAdjust = meta.color === color ? 3 : -1;
+      const metaStrengthAdjust = Math.round(((meta.top8Rate || 50) - 50) * 0.1);
+      const sampleAdjust = Math.round(Math.log2((meta.entries || 1) + 1));
+      const placementAdjust = Math.round((10 - Math.min(10, meta.avgPlacement || 10)) * 0.4);
+      return {
+        leader: meta.leader,
+        winRate: clamp(50 + Math.round((optimizationScore - 60) * 0.2) + colorAdjust - metaStrengthAdjust + sampleAdjust + placementAdjust, 35, 75),
+      };
+    });
 
     const insights = [
       `Curve tuned for ${playstyle} profile with avg cost ${avgCost.toFixed(1)}.`,
@@ -1369,9 +1422,10 @@ const optimizeDeck = async (req, res) => {
       return res.status(400).json({ message: "decklist/deck_cards is required and must not be empty" });
     }
 
-    const cardsRaw = await cardsDb.find({}).lean();
+    const [cardsRaw, standingsRaw] = await Promise.all([cardsDb.find({}).lean(), standingsDb.find({}).lean()]);
     const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
     const allCardsByCode = new Map(activeCards.map((card) => [card.card_code, card]));
+    const metaLeaders = buildMetaLeaderRowsFromStandings({ standings: standingsRaw, cards: activeCards });
 
     // Build deck from provided full decklist first; fallback to DB lookup by id.
     const expandedDeck = [];
@@ -1387,7 +1441,7 @@ const optimizeDeck = async (req, res) => {
     const roleBreakdown = computeRoleBreakdown(expandedDeck);
     const synergyScore = computeSynergy(expandedDeck, leader);
     const consistencyScore = computeConsistency({ expandedDeck, costCurve, roleBreakdown });
-    const metaFitScore = computeMetaFit({ leader, roleBreakdown, costCurve, consistencyScore });
+    const metaFitScore = computeMetaFit({ leader, roleBreakdown, costCurve, consistencyScore, metaLeaders });
     const weaknesses = findWeaknesses({ roleBreakdown, costCurve, expandedDeck });
 
     const leaderColor = normalizeText(leader?.color || "");
