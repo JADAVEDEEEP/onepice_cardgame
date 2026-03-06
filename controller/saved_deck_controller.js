@@ -223,6 +223,4 @@ module.exports = {
   saveDeck,
   listSavedDecks,
   getSavedDeckById,
-  updateSavedDeck,
-  deleteSavedDeck,
 };
