@@ -2,6 +2,9 @@
 const standingsDb = require("../model/standings_db");
 // tournaments collection ka model import (event metadata yaha se aata hai)
 const tournamentsDb = require("../model/tournaments_db");
+const { cacheGetJson, cacheSetJson } = require("../config/cache");
+
+const META_CACHE_TTL_MS = Math.max(5_000, parseInt(process.env.META_CACHE_TTL_MS || "120000", 10));
 
 // Generic helper: value ko number me convert karta hai
 // Agar value invalid ho to fallback return karta hai
@@ -42,6 +45,17 @@ const getBestDeck = async (req, res) => {
   try {
     // Query params read kar rahe hain
     const { format, date_from, date_to, region, country, min_players, limit } = req.query;
+    const cacheKey = `meta:best-deck:${JSON.stringify({
+      format: format || null,
+      date_from: date_from || null,
+      date_to: date_to || null,
+      region: region || null,
+      country: country || null,
+      min_players: min_players || null,
+      limit: limit || null,
+    })}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
     // min_players ko safe number me parse kiya
     const minPlayers = parseNumber(min_players, 0);
 
@@ -280,6 +294,7 @@ const getBestDeck = async (req, res) => {
     };
 
     // Success response send
+    await cacheSetJson(cacheKey, response, META_CACHE_TTL_MS);
     return res.json(response);
   } catch (error) {
     // Unexpected failure case
@@ -301,6 +316,14 @@ const getDeckDetails = async (req, res) => {
 
     // Optional query filters
     const { format, date_from, date_to } = req.query;
+    const cacheKey = `meta:deck-details:${JSON.stringify({
+      deck: deckNameRaw,
+      format: format || null,
+      date_from: date_from || null,
+      date_to: date_to || null,
+    })}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
 
     // Regex-safe exact match (case-insensitive)
     const deckRegex = new RegExp(`^${deckNameRaw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
@@ -428,7 +451,7 @@ const getDeckDetails = async (req, res) => {
       .slice(0, 30);
 
     // Final deck-details response
-    return res.json({
+    const response = {
       deck: standings[0].deck || deckNameRaw,
       summary: {
         entries: standings.length,
@@ -443,7 +466,9 @@ const getDeckDetails = async (req, res) => {
       top_players: topPlayers,
       recent_results: recentResults,
       generated_at: new Date().toISOString(),
-    });
+    };
+    await cacheSetJson(cacheKey, response, META_CACHE_TTL_MS);
+    return res.json(response);
   } catch (error) {
     // Unexpected failure case
     return res.status(500).json({ message: "Failed to fetch deck details", error: error.message });

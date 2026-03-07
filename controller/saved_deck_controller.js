@@ -1,5 +1,8 @@
 const savedDeckDb = require("../model/saved_decks_db");
 const mongoose = require("mongoose");
+const { cacheGetJson, cacheSetJson, cacheDelByPrefix } = require("../config/cache");
+
+const SAVED_DECK_CACHE_TTL_MS = Math.max(5_000, Number(process.env.SAVED_DECK_CACHE_TTL_MS) || 60_000);
 
 const parseNumber = (value, fallback = 0) => {
   if (typeof value === "number") return Number.isFinite(value) ? value : fallback;
@@ -65,6 +68,11 @@ const saveDeck = async (req, res) => {
     };
 
     const saved = await savedDeckDb.create(payload);
+    await Promise.all([
+      cacheDelByPrefix("decks:list:"),
+      cacheDelByPrefix("analytics:matchup-matrix:"),
+      cacheDelByPrefix("analytics:saved-deck-profile:"),
+    ]);
 
     return res.status(201).json({
       message: "Deck saved successfully",
@@ -95,6 +103,10 @@ const listSavedDecks = async (req, res) => {
       ];
     }
 
+    const cacheKey = `decks:list:${JSON.stringify({ page, limit, q: queryText || null })}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
+
     const [decks, total] = await Promise.all([
       savedDeckDb
         .find(query)
@@ -106,7 +118,7 @@ const listSavedDecks = async (req, res) => {
       savedDeckDb.countDocuments(query),
     ]);
 
-    return res.json({
+    const response = {
       decks,
       count: decks.length,
       pagination: {
@@ -120,7 +132,9 @@ const listSavedDecks = async (req, res) => {
       filters: {
         q: queryText || null,
       },
-    });
+    };
+    await cacheSetJson(cacheKey, response, SAVED_DECK_CACHE_TTL_MS);
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({ message: "Failed to fetch saved decks", error: error.message });
   }
@@ -192,9 +206,13 @@ const getSavedDeckById = async (req, res) => {
       return res.status(400).json({ message: "Invalid deckId" });
     }
 
+    const cacheKey = `decks:by-id:${deckId}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
+
     const deck = await savedDeckDb.findById(deckId).lean();
     if (!deck) return res.status(404).json({ message: "Saved deck not found" });
-
+    await cacheSetJson(cacheKey, deck, SAVED_DECK_CACHE_TTL_MS);
     return res.json(deck);
   } catch (error) {
     return res.status(500).json({ message: "Failed to fetch saved deck", error: error.message });

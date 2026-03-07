@@ -3,6 +3,7 @@ const standingsDb = require("../model/standings_db");
 const tournamentsDb = require("../model/tournaments_db");
 const savedDeckDb = require("../model/saved_decks_db");
 const mongoose = require("mongoose");
+const { cacheGetJson, cacheSetJson } = require("../config/cache");
 
 // Yeh helper kisi bhi numeric value ko safe number me convert karta hai.
 const parseNumber = (value, fallback = 0) => {
@@ -28,24 +29,11 @@ const daysBetween = (d1, d2) => Math.max(0, Math.floor((d1.getTime() - d2.getTim
 
 // Yeh helper score values ko min-max range ke andar rakhta hai.
 const clamp = (value, min = 0, max = 100) => Math.max(min, Math.min(max, value));
-const analyticsCache = new Map();
 const ANALYTICS_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_CACHE_TTL_MS, 60_000));
-
-// Yeh helper cached response return karta hai agar key valid TTL ke andar hai.
-const getCachedResponse = (key) => {
-  const hit = analyticsCache.get(key);
-  if (!hit) return null;
-  if (Date.now() - hit.ts > ANALYTICS_CACHE_TTL_MS) {
-    analyticsCache.delete(key);
-    return null;
-  }
-  return hit.value;
-};
-
-// Yeh helper response ko cache me store karta hai.
-const setCachedResponse = (key, value) => {
-  analyticsCache.set(key, { ts: Date.now(), value });
-};
+const ANALYTICS_OPTIMIZE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_OPTIMIZE_CACHE_TTL_MS, 45_000));
+const ANALYTICS_GENERATE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_GENERATE_CACHE_TTL_MS, 120_000));
+const ANALYTICS_COLOR_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_COLOR_CACHE_TTL_MS, 120_000));
+const ANALYTICS_PROFILE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_PROFILE_CACHE_TTL_MS, 60_000));
 
 // Yeh helper standings se top meta leaders nikalta hai (DB-driven, no static list).
 const buildMetaLeaderRowsFromStandings = ({ standings, cards }) => {
@@ -1094,7 +1082,7 @@ const getMatchupMatrix = async (req, res) => {
     const limit = clamp(parsedLimit, 4, 30);
     const page = Math.max(1, parseNumber(pageRaw, 1));
 
-    const cacheKey = JSON.stringify({
+    const cacheKey = `analytics:matchup-matrix:${JSON.stringify({
       format: format || "all",
       limit,
       page,
@@ -1102,8 +1090,8 @@ const getMatchupMatrix = async (req, res) => {
       dateTo: dateTo || null,
       savedDeckId: savedDeckId || null,
       deckQuery: deckQuery || null,
-    });
-    const cached = getCachedResponse(cacheKey);
+    })}`;
+    const cached = await cacheGetJson(cacheKey);
     if (cached) return res.json({ ...cached, cache: "hit" });
 
     const standingsQuery = {};
@@ -1183,7 +1171,7 @@ const getMatchupMatrix = async (req, res) => {
       generated_at: new Date().toISOString(),
       cache: "miss",
     };
-    setCachedResponse(cacheKey, response);
+    await cacheSetJson(cacheKey, response, ANALYTICS_CACHE_TTL_MS);
     return res.json(response);
   } catch (error) {
     return res.status(500).json({ message: "Failed to build matchup matrix", error: error.message });
@@ -1195,6 +1183,9 @@ const getSavedDeckProfile = async (req, res) => {
   try {
     const deckId = String(req.params?.deckId || "").trim();
     if (!deckId) return res.status(400).json({ message: "deckId is required" });
+    const cacheKey = `analytics:saved-deck-profile:${deckId}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
 
     const [savedDeck, cardsRaw] = await Promise.all([
       savedDeckDb.findById(deckId).lean(),
@@ -1205,7 +1196,7 @@ const getSavedDeckProfile = async (req, res) => {
     const cardsByCode = new Map(cardsRaw.filter(isCardActive).map(toInternalCard).map((c) => [c.card_code, c]));
     const stat = buildDeckStatFromSavedDeck({ savedDeck, cardsByCode });
 
-    return res.json({
+    const response = {
       deck: savedDeck.deck_name,
       summary: {
         entries: stat.entries,
@@ -1219,7 +1210,9 @@ const getSavedDeckProfile = async (req, res) => {
       saved_deck_id: String(savedDeck._id),
       is_custom: true,
       generated_at: new Date().toISOString(),
-    });
+    };
+    await cacheSetJson(cacheKey, response, ANALYTICS_PROFILE_CACHE_TTL_MS);
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({ message: "Failed to build saved deck profile", error: error.message });
   }
@@ -1233,6 +1226,15 @@ const bestColorFinder = async (req, res) => {
     const playstyle = normalizeText(req.body?.playstyle || "midrange");
     const budgetMode = Boolean(req.body?.budgetMode);
     const metaWeight = normalizeText(req.body?.metaWeight || "balanced");
+    const cacheKey = `analytics:best-color:${JSON.stringify({
+      dateWindow,
+      requestedFormat,
+      playstyle,
+      budgetMode,
+      metaWeight,
+    })}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
 
     const dateFrom = new Date();
     dateFrom.setDate(dateFrom.getDate() - Math.max(1, dateWindow));
@@ -1278,7 +1280,7 @@ const bestColorFinder = async (req, res) => {
     });
     const topColor = colorStats[0] || null;
 
-    return res.json({
+    const response = {
       colorStats,
       topRecommendation: topColor,
       filters: {
@@ -1298,7 +1300,9 @@ const bestColorFinder = async (req, res) => {
           ]
         : [],
       generated_at: new Date().toISOString(),
-    });
+    };
+    await cacheSetJson(cacheKey, response, ANALYTICS_COLOR_CACHE_TTL_MS);
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({ message: "Failed to compute best color stats", error: error.message });
   }
@@ -1313,6 +1317,16 @@ const generateBestDeck = async (req, res) => {
     const metaContext = normalizeText(req.body?.metaContext || "balanced");
     const preferredLeader = normalizeText(req.body?.leader || "");
     const deckSize = clamp(parseNumber(req.body?.deckSize, 50), 40, 60);
+    const cacheKey = `analytics:generate-best-deck:${JSON.stringify({
+      color,
+      playstyle,
+      riskMode,
+      metaContext,
+      preferredLeader,
+      deckSize,
+    })}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
 
     const [cardsRaw, standingsRaw] = await Promise.all([cardsDb.find({}).lean(), standingsDb.find({}).lean()]);
     const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
@@ -1393,7 +1407,7 @@ const generateBestDeck = async (req, res) => {
       `Estimated optimization score ${optimizationScore}/100 under ${metaContext} meta context.`,
     ];
 
-    return res.json({
+    const response = {
       leader: selectedLeader
         ? { name: selectedLeader.name, code: selectedLeader.card_code, image_url: selectedLeader.image_url }
         : null,
@@ -1405,7 +1419,9 @@ const generateBestDeck = async (req, res) => {
       curve,
       matchupPreview,
       generated_at: new Date().toISOString(),
-    });
+    };
+    await cacheSetJson(cacheKey, response, ANALYTICS_GENERATE_CACHE_TTL_MS);
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({ message: "Failed to generate best deck", error: error.message });
   }
@@ -1421,6 +1437,18 @@ const optimizeDeck = async (req, res) => {
     if (deckItems.length === 0) {
       return res.status(400).json({ message: "decklist/deck_cards is required and must not be empty" });
     }
+    const deckSignature = deckItems
+      .map((item) => `${item.card_code}:${item.count}`)
+      .sort()
+      .join("|");
+    const cacheKey = `analytics:optimize:${JSON.stringify({
+      leader_code: normalizeText(leader?.card_code || leader?.id || leader?.name || ""),
+      leader_color: normalizeText(leader?.color || ""),
+      deckSize,
+      deckSignature,
+    })}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
 
     const [cardsRaw, standingsRaw] = await Promise.all([cardsDb.find({}).lean(), standingsDb.find({}).lean()]);
     const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
@@ -1486,7 +1514,7 @@ const optimizeDeck = async (req, res) => {
       )
     );
 
-    return res.json({
+    const response = {
       costCurve,
       roleBreakdown,
       synergyScore,
@@ -1503,7 +1531,9 @@ const optimizeDeck = async (req, res) => {
       },
       suggestions,
       generated_at: new Date().toISOString(),
-    });
+    };
+    await cacheSetJson(cacheKey, response, ANALYTICS_OPTIMIZE_CACHE_TTL_MS);
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({ message: "Failed to optimize deck", error: error.message });
   }
