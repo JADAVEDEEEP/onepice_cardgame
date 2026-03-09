@@ -10,32 +10,74 @@ let redisClient = null;
 let redisInitTried = false;
 let redisReady = false;
 let redisLastAttemptAt = 0;
+let redisInitPromise = null;
 
 const CACHE_KEY_PREFIX = process.env.CACHE_KEY_PREFIX || "optcg:";
 const REDIS_RETRY_MS = Math.max(5_000, Number(process.env.REDIS_RETRY_MS) || 30_000);
+const REDIS_CONNECT_TIMEOUT_MS = Math.max(
+  300,
+  Number(process.env.REDIS_CONNECT_TIMEOUT_MS) || 1200
+);
+
+const normalizeTtlMs = (ttlMs) => {
+  const n = Number(ttlMs);
+  if (!Number.isFinite(n) || n <= 0) return 60_000;
+  return Math.max(1000, n);
+};
+
+const withTimeout = (promise, ms) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`redis_connect_timeout_${ms}ms`)), ms)
+    ),
+  ]);
 
 const getRedisClient = async () => {
   const redisUrl = process.env.REDIS_URL;
   if (!redisUrl || !createClient) return null;
   if (redisReady && redisClient) return redisClient;
+  if (redisInitPromise) return null;
   if (redisInitTried && !redisReady && Date.now() - redisLastAttemptAt < REDIS_RETRY_MS) {
     return null;
   }
 
   redisInitTried = true;
   redisLastAttemptAt = Date.now();
-  try {
-    redisClient = createClient({ url: redisUrl });
-    redisClient.on("error", () => {
+  redisInitPromise = (async () => {
+    try {
+      const client = createClient({
+        url: redisUrl,
+        socket: {
+          connectTimeout: REDIS_CONNECT_TIMEOUT_MS,
+          reconnectStrategy: false,
+        },
+      });
+      client.on("error", () => {
+        redisReady = false;
+      });
+      await withTimeout(client.connect(), REDIS_CONNECT_TIMEOUT_MS);
+      redisClient = client;
+      redisReady = true;
+      return client;
+    } catch {
       redisReady = false;
-    });
-    await redisClient.connect();
-    redisReady = true;
-    return redisClient;
-  } catch (error) {
-    redisReady = false;
-    return null;
-  }
+      if (redisClient && redisClient.isOpen) {
+        try {
+          await redisClient.quit();
+        } catch {
+          // no-op
+        }
+      }
+      redisClient = null;
+      return null;
+    } finally {
+      redisInitPromise = null;
+    }
+  })();
+
+  // Do not block API responses waiting for Redis connection.
+  return null;
 };
 
 const getMemory = (key) => {
@@ -49,7 +91,7 @@ const getMemory = (key) => {
 };
 
 const setMemory = (key, value, ttlMs) => {
-  memoryCache.set(key, { value, expiresAt: Date.now() + Math.max(1000, ttlMs) });
+  memoryCache.set(key, { value, expiresAt: Date.now() + normalizeTtlMs(ttlMs) });
 };
 
 const cacheGetJson = async (key) => {
@@ -68,16 +110,17 @@ const cacheGetJson = async (key) => {
 
 const cacheSetJson = async (key, value, ttlMs) => {
   const cacheKey = `${CACHE_KEY_PREFIX}${key}`;
+  const ttl = normalizeTtlMs(ttlMs);
   const client = await getRedisClient();
   if (client) {
     try {
-      await client.set(cacheKey, JSON.stringify(value), { PX: Math.max(1000, ttlMs) });
+      await client.set(cacheKey, JSON.stringify(value), { PX: ttl });
       return;
     } catch {
       // no-op and fall back below
     }
   }
-  setMemory(cacheKey, value, ttlMs);
+  setMemory(cacheKey, value, ttl);
 };
 
 const cacheDel = async (key) => {

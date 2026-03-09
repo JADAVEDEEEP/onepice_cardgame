@@ -97,9 +97,11 @@ router.get("/recent", async (req, res) => {
     const limitParam = String(req.query?.limit || "").trim().toLowerCase();
     const showAll = !limitParam || limitParam === "all" || limitParam === "0";
     const limitRaw = Number(limitParam);
-    const limit = Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 20);
+    const limit = Math.max(1, Math.min(200, Number.isFinite(limitRaw) ? limitRaw : 20));
 
-    const query = TopicAlertState.find({}).sort({ first_seen_at: -1 });
+    const query = TopicAlertState.find({})
+      .select("url title published_at summary first_seen_at last_notified_at createdAt")
+      .sort({ first_seen_at: -1 });
     if (!showAll) {
       query.limit(limit);
     }
