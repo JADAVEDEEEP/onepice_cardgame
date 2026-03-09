@@ -51,8 +51,6 @@ const corsOptions = {
   },
 };
 
-//connect to the database
-connectDB();
 //parssing the incoimg request body as json data in to the javascript object
 app.use(express.json({ limit: "1mb" }));
 app.use(cors(corsOptions));
@@ -89,7 +87,17 @@ app.use((error, req, res, next) => {
 });
 
 const port = Number(process.env.PORT) || 3000;
-app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
-    startTopicWatcher();
-});
+const startServer = async () => {
+  try {
+    await connectDB();
+    app.listen(port, () => {
+      console.log(`Server is running on port ${port}`);
+      startTopicWatcher();
+    });
+  } catch (error) {
+    console.error("Fatal startup error:", error?.message || error);
+    process.exit(1);
+  }
+};
+
+void startServer();
