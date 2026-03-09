@@ -6,7 +6,9 @@ const cards = require('./routes/card');
 const meta = require('./routes/meta');
 const analytics = require('./routes/analytics');
 const deck = require('./routes/deck');
+const watcher = require('./routes/watcher');
 const connectDB = require('./config/configdb');
+const { startTopicWatcher } = require("./services/topic_watcher_service");
 const app = express();
 app.set("trust proxy", 1);
 
@@ -76,6 +78,8 @@ app.use('/cardsApi',cards)
 app.use('/meta', meta);
 app.use('/analytics', analytics);
 app.use('/decks', deck);
+app.use('/watcher', watcher);
+app.use('/watcher.js', watcher);
 
 app.use((error, req, res, next) => {
   if (error && String(error.message || "").includes("CORS")) {
@@ -87,4 +91,5 @@ app.use((error, req, res, next) => {
 const port = Number(process.env.PORT) || 3000;
 app.listen(port, () => {
     console.log(`Server is running on port ${port}`);
+    startTopicWatcher();
 });
