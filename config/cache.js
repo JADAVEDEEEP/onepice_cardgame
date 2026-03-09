@@ -9,16 +9,21 @@ const memoryCache = new Map();
 let redisClient = null;
 let redisInitTried = false;
 let redisReady = false;
+let redisLastAttemptAt = 0;
 
 const CACHE_KEY_PREFIX = process.env.CACHE_KEY_PREFIX || "optcg:";
+const REDIS_RETRY_MS = Math.max(5_000, Number(process.env.REDIS_RETRY_MS) || 30_000);
 
 const getRedisClient = async () => {
   const redisUrl = process.env.REDIS_URL;
   if (!redisUrl || !createClient) return null;
   if (redisReady && redisClient) return redisClient;
-  if (redisInitTried && !redisReady) return null;
+  if (redisInitTried && !redisReady && Date.now() - redisLastAttemptAt < REDIS_RETRY_MS) {
+    return null;
+  }
 
   redisInitTried = true;
+  redisLastAttemptAt = Date.now();
   try {
     redisClient = createClient({ url: redisUrl });
     redisClient.on("error", () => {

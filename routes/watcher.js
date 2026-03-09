@@ -118,6 +118,28 @@ router.get("/recent", async (req, res) => {
         if (byPublished !== 0) return byPublished;
         return Date.parse(String(b.first_seen_at || 0)) - Date.parse(String(a.first_seen_at || 0));
       });
+
+    const allowFallback = String(req.query?.fallback || "true").toLowerCase() !== "false";
+    if (events.length === 0 && allowFallback) {
+      const livePosts = await fetchTopicPostsOnce();
+      const sortedLive = [...livePosts].sort(
+        (a, b) => parsePublishedAt(b.published_at) - parsePublishedAt(a.published_at)
+      );
+      const liveEvents = (showAll ? sortedLive : sortedLive.slice(0, limit)).map((post) => ({
+        url: post.url,
+        title: post.title || "",
+        published_at: post.published_at || "",
+        summary: post.summary || "",
+        first_seen_at: null,
+        last_notified_at: null,
+        source: "live_scrape",
+      }));
+      return res.json({
+        count: liveEvents.length,
+        events: liveEvents,
+      });
+    }
+
     return res.json({
       count: events.length,
       events,
