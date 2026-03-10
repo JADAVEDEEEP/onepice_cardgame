@@ -1311,7 +1311,9 @@ const bestColorFinder = async (req, res) => {
 // Yeh endpoint selected inputs ke basis par best deck generate karta hai.
 const generateBestDeck = async (req, res) => {
   try {
-    const color = normalizeText(req.body?.color || "red");
+    const rawColorInput = normalizeText(req.body?.color || "red");
+    const colorList = rawColorInput.split(/[\\/,&]/).map((part) => normalizeText(part)).filter(Boolean);
+    const color = colorList[0] || "red";
     const playstyle = normalizeText(req.body?.playstyle || "balanced");
     const riskMode = normalizeText(req.body?.riskMode || "consistency");
     const metaContext = normalizeText(req.body?.metaContext || "balanced");
@@ -1330,8 +1332,12 @@ const generateBestDeck = async (req, res) => {
 
     const [cardsRaw, standingsRaw] = await Promise.all([cardsDb.find({}).lean(), standingsDb.find({}).lean()]);
     const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
-    const colorPool = activeCards.filter((card) => card.color === color && card.type !== "leader");
-    const leaders = activeCards.filter((card) => card.color === color && card.type === "leader");
+    const matchesRequestedColor = (cardColor) =>
+      colorList.some((col) => normalizeText(cardColor).includes(col));
+    const colorPool = activeCards.filter(
+      (card) => card.type !== "leader" && matchesRequestedColor(card.color)
+    );
+    const leaders = activeCards.filter((card) => card.type === "leader" && matchesRequestedColor(card.color));
     const metaLeaders = buildMetaLeaderRowsFromStandings({ standings: standingsRaw, cards: activeCards });
 
     const selectedLeader =
@@ -1385,9 +1391,16 @@ const generateBestDeck = async (req, res) => {
       return { cost, count };
     });
 
-    const liveMatchupLeaders = metaLeaders.length > 0
-      ? metaLeaders
-      : [{ leader: "Open Meta", color, top8Rate: 50, entries: 1, avgPlacement: 8 }];
+    const colorTagLabel = colorList.join("/");
+    const metaColorMatchesRequest = (meta) =>
+      colorList.some((col) => normalizeText(meta.color).includes(col));
+    const matchingColorLeaders = metaLeaders.filter(metaColorMatchesRequest);
+    const liveMatchupLeaders =
+      matchingColorLeaders.length > 0
+        ? matchingColorLeaders
+        : metaLeaders.length > 0
+          ? metaLeaders
+          : [{ leader: "Open Meta", color, top8Rate: 50, entries: 1, avgPlacement: 8 }];
     const matchupPreview = liveMatchupLeaders.slice(0, 5).map((meta) => {
       const colorAdjust = meta.color === color ? 3 : -1;
       const metaStrengthAdjust = Math.round(((meta.top8Rate || 50) - 50) * 0.1);
@@ -1411,7 +1424,7 @@ const generateBestDeck = async (req, res) => {
       leader: selectedLeader
         ? { name: selectedLeader.name, code: selectedLeader.card_code, image_url: selectedLeader.image_url }
         : null,
-      tags: [playstyle, riskMode, color],
+      tags: [playstyle, riskMode, colorTagLabel || color],
       optimizationScore,
       analytics,
       deckCards,

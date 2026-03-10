@@ -140,63 +140,6 @@ const listSavedDecks = async (req, res) => {
   }
 };
 
-// Yeh endpoint saved deck ko update karta hai (public mode, no auth).
-const updateSavedDeck = async (req, res) => {
-  try {
-    const deckId = String(req.params?.deckId || "").trim();
-    if (!deckId) return res.status(400).json({ message: "deckId is required" });
-    if (!mongoose.Types.ObjectId.isValid(deckId)) {
-      return res.status(400).json({ message: "Invalid deckId" });
-    }
-
-    const existing = await savedDeckDb.findById(deckId).lean();
-    if (!existing) return res.status(404).json({ message: "Saved deck not found" });
-
-    const deckNameRaw = String(req.body?.deck_name || "").trim();
-    const leader = req.body?.leader || {};
-    const tags = Array.isArray(req.body?.tags) ? req.body.tags : [];
-    const notes = req.body?.notes != null ? String(req.body?.notes || "").trim() : existing.notes || "";
-    const normalizedCards = normalizeSavedDeckItems(req.body);
-
-    const updatePayload = {
-      ...(deckNameRaw ? { deck_name: deckNameRaw } : {}),
-      ...(req.body?.leader
-        ? {
-            leader: {
-              card_code: String(leader?.card_code || leader?.code || "").trim(),
-              name: String(leader?.name || "").trim(),
-              color: String(leader?.color || "").trim().toLowerCase(),
-            },
-          }
-        : {}),
-      ...(req.body?.tags ? { tags: tags.map((tag) => String(tag || "").trim()).filter(Boolean) } : {}),
-      ...(req.body?.notes != null ? { notes } : {}),
-    };
-
-    if (normalizedCards.length > 0) {
-      const deckSize = normalizedCards.reduce((sum, item) => sum + item.count, 0);
-      if (deckSize > 60) {
-        return res.status(400).json({ message: "deck_size too large; expected 50 or close variants" });
-      }
-      updatePayload.deck_cards = normalizedCards;
-      updatePayload.decklist = normalizedCards;
-      updatePayload.deck_size = deckSize;
-    }
-
-    const updated = await savedDeckDb
-      .findByIdAndUpdate(deckId, { $set: updatePayload }, { new: true })
-      .select("deck_name leader deck_cards deck_size tags notes createdAt updatedAt")
-      .lean();
-
-    return res.json({
-      message: "Deck updated successfully",
-      deck: updated,
-    });
-  } catch (error) {
-    return res.status(500).json({ message: "Failed to update saved deck", error: error.message });
-  }
-};
-
 // Yeh endpoint ek specific saved deck ka full detail return karta hai.
 const getSavedDeckById = async (req, res) => {
   try {
@@ -219,23 +162,6 @@ const getSavedDeckById = async (req, res) => {
   }
 };
 
-// Yeh endpoint saved deck delete karta hai.
-const deleteSavedDeck = async (req, res) => {
-  try {
-    const deckId = String(req.params?.deckId || "").trim();
-    if (!deckId) return res.status(400).json({ message: "deckId is required" });
-    if (!mongoose.Types.ObjectId.isValid(deckId)) {
-      return res.status(400).json({ message: "Invalid deckId" });
-    }
-
-    const deleted = await savedDeckDb.findByIdAndDelete(deckId);
-    if (!deleted) return res.status(404).json({ message: "Saved deck not found" });
-
-    return res.json({ message: "Deck deleted successfully", deck_id: deckId });
-  } catch (error) {
-    return res.status(500).json({ message: "Failed to delete saved deck", error: error.message });
-  }
-};
 
 module.exports = {
   saveDeck,
