@@ -10,7 +10,7 @@ const WATCH_INTERVAL_MS = Math.max(
 );
 const WATCH_ENABLED = String(process.env.TOPICS_WATCH_ENABLED || "true").toLowerCase() === "true";
 const BOOTSTRAP_SILENT =
-  String(process.env.TOPICS_WATCH_BOOTSTRAP_SILENT || "true").toLowerCase() === "true";
+  String(process.env.TOPICS_WATCH_BOOTSTRAP_SILENT || "false").toLowerCase() === "true";
 
 const status = {
   running: false,
@@ -67,21 +67,21 @@ const extractTopicPosts = (html) => {
     const cardText = normalizeSpace(card.text());
     const dateText = normalizeSpace(
       card.find("time").first().attr("datetime") ||
-        card.find("time").first().text() ||
-        card.find(".date, .news-date, .topics-date, .entry-date, .post-date").first().text() ||
-        extractDateFromText(parentText) ||
-        extractDateFromText(grandParentText) ||
-        extractDateFromText(cardText) ||
-        extractDateFromText(title) ||
-        ""
+      card.find("time").first().text() ||
+      card.find(".date, .news-date, .topics-date, .entry-date, .post-date").first().text() ||
+      extractDateFromText(parentText) ||
+      extractDateFromText(grandParentText) ||
+      extractDateFromText(cardText) ||
+      extractDateFromText(title) ||
+      ""
     );
     const summary = normalizeSpace(
       card.find("p, .lead, .desc, .summary").first().text() || title
     );
-    const publishedAt = dateText || extractDateFromText(`${title} ${summary}`);
-    if (!publishedAt) return;
+    const publishedAt = dateText || extractDateFromText(`${title} ${summary}`) || "";
 
-    const eventKey = `${url}__${normalizeSpace(title).toLowerCase()}__${publishedAt.toLowerCase()}`;
+    // Use URL as the stable event key (date may not be parseable on all sites)
+    const eventKey = url;
     if (seen.has(eventKey)) return;
 
     seen.add(eventKey);
@@ -109,15 +109,15 @@ const sendNewTopicEmail = async (posts) => {
 
   const transporter = mailHost
     ? nodemailer.createTransport({
-        host: mailHost,
-        port: mailPort || 587,
-        secure: mailSecure,
-        auth: { user, pass },
-      })
+      host: mailHost,
+      port: mailPort || 587,
+      secure: mailSecure,
+      auth: { user, pass },
+    })
     : nodemailer.createTransport({
-        service: "gmail",
-        auth: { user, pass },
-      });
+      service: "gmail",
+      auth: { user, pass },
+    });
 
   const subject =
     posts.length === 1
@@ -210,11 +210,23 @@ const runTopicWatcherOnce = async () => {
 
     const existingCount = await TopicAlertState.countDocuments({});
     const eventKeys = posts.map((p) => p.event_key);
-    const existingRows = await TopicAlertState.find({ event_key: { $in: eventKeys } })
+    const urls = posts.map((p) => p.url);
+    // Match by new-format event_key (url) OR the old-format key OR by url field directly
+    // This ensures backward compatibility when event_key format changed
+    const existingRows = await TopicAlertState.find({
+      $or: [{ event_key: { $in: eventKeys } }, { url: { $in: urls } }],
+    })
       .select("event_key url published_at summary")
       .lean();
-    const existingMap = new Map(existingRows.map((row) => [row.event_key, row]));
-    const existingSet = new Set(existingRows.map((row) => row.event_key));
+    // Build lookup by BOTH event_key and url so old-format rows are recognised
+    const existingMap = new Map([
+      ...existingRows.map((row) => [row.event_key, row]),
+      ...existingRows.map((row) => [row.url, row]),
+    ]);
+    const existingSet = new Set([
+      ...existingRows.map((row) => row.event_key),
+      ...existingRows.map((row) => row.url),
+    ]);
 
     const fresh = posts.filter((p) => !existingSet.has(p.event_key));
     const updates = posts.filter((p) => {
@@ -239,7 +251,7 @@ const runTopicWatcherOnce = async () => {
           last_notified_at: null,
         })),
         { ordered: false }
-      ).catch(() => {});
+      ).catch(() => { });
     }
 
     if (updates.length > 0) {
@@ -251,7 +263,7 @@ const runTopicWatcherOnce = async () => {
           },
         })),
         { ordered: false }
-      ).catch(() => {});
+      ).catch(() => { });
     }
 
     const notifyCandidates = [
