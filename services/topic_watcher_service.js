@@ -26,6 +26,22 @@ const status = {
 
 let timer = null;
 
+const withTimeout = async (promise, ms, label) => {
+  const timeoutMs = Math.max(1000, Number(ms) || 0);
+  if (!timeoutMs) return promise;
+  let t = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        t = setTimeout(() => reject(new Error(`${label || "timeout"}_${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (t) clearTimeout(t);
+  }
+};
+
 const toAbsoluteUrl = (href) => {
   try {
     return new URL(href, TOPICS_URL).toString();
@@ -106,6 +122,7 @@ const sendNewTopicEmail = async (posts) => {
   const mailHost = process.env.MAIL_HOST || "";
   const mailPort = Number(process.env.MAIL_PORT || 0) || undefined;
   const mailSecure = String(process.env.MAIL_SECURE || "").toLowerCase() === "true";
+  const mailTimeoutMs = Math.max(3_000, Number(process.env.MAIL_TIMEOUT_MS) || 12_000);
 
   const transporter = mailHost
     ? nodemailer.createTransport({
@@ -113,10 +130,16 @@ const sendNewTopicEmail = async (posts) => {
       port: mailPort || 587,
       secure: mailSecure,
       auth: { user, pass },
+      connectionTimeout: mailTimeoutMs,
+      greetingTimeout: mailTimeoutMs,
+      socketTimeout: Math.max(mailTimeoutMs, 20_000),
     })
     : nodemailer.createTransport({
       service: "gmail",
       auth: { user, pass },
+      connectionTimeout: mailTimeoutMs,
+      greetingTimeout: mailTimeoutMs,
+      socketTimeout: Math.max(mailTimeoutMs, 20_000),
     });
 
   const subject =
@@ -141,14 +164,18 @@ const sendNewTopicEmail = async (posts) => {
     )
     .join("");
 
-  await transporter.verify();
-  await transporter.sendMail({
-    from: `"OPTCG Watcher" <${user}>`,
-    to,
-    subject,
-    text: textLines.join("\n\n"),
-    html: `<div><p>New One Piece Card Game topics detected:</p><ol>${htmlItems}</ol></div>`,
-  });
+  await withTimeout(transporter.verify(), mailTimeoutMs, "mail_verify_timeout");
+  await withTimeout(
+    transporter.sendMail({
+      from: `"OPTCG Watcher" <${user}>`,
+      to,
+      subject,
+      text: textLines.join("\n\n"),
+      html: `<div><p>New One Piece Card Game topics detected:</p><ol>${htmlItems}</ol></div>`,
+    }),
+    Math.max(mailTimeoutMs, 20_000),
+    "mail_send_timeout"
+  );
 
   return { sent: true };
 };
@@ -181,13 +208,18 @@ const sendTopicWatcherTestEmail = async () => {
 
 const fetchTopicPostsOnce = async () => {
   const cacheBustUrl = `${TOPICS_URL}${TOPICS_URL.includes("?") ? "&" : "?"}_ts=${Date.now()}`;
+  const fetchTimeoutMs = Math.max(3_000, Number(process.env.TOPICS_FETCH_TIMEOUT_MS) || 12_000);
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), fetchTimeoutMs);
   const response = await fetch(cacheBustUrl, {
     headers: {
       "user-agent": "OPTCGDeckLabWatcher/1.0 (+email-alert)",
       "cache-control": "no-cache",
       pragma: "no-cache",
     },
+    signal: controller.signal,
   });
+  clearTimeout(t);
   if (!response.ok) {
     throw new Error(`Topics fetch failed with status ${response.status}`);
   }

@@ -65,7 +65,7 @@ const testEmailHandler = async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       message: "Test email failed",
-      error: error.message,
+      error: String(error?.message || error || "unknown_error"),
       status: getTopicWatcherStatus(),
     });
   }

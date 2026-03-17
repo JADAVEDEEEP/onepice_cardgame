@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "dev": "nodemon index.js",
-    "start": "node index.js"
+    "start": "node index.js",
+    "watcher:run-once": "node scripts/run-topic-watcher-once.js"
   },
   "author": "",
   "license": "ISC",
