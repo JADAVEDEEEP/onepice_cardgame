@@ -7,6 +7,7 @@ const meta = require('./routes/meta');
 const analytics = require('./routes/analytics');
 const deck = require('./routes/deck');
 const watcher = require('./routes/watcher');
+const ai = require('./routes/ai');
 const connectDB = require('./config/configdb');
 const { startTopicWatcher } = require("./services/topic_watcher_service");
 const app = express();
@@ -78,6 +79,7 @@ app.use('/analytics', analytics);
 app.use('/decks', deck);
 app.use('/watcher', watcher);
 app.use('/watcher.js', watcher);
+app.use('/ai', ai);
 
 app.use((error, req, res, next) => {
   if (error && String(error.message || "").includes("CORS")) {
