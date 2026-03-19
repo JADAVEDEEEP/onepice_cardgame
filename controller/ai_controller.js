@@ -156,6 +156,26 @@ const validatePayload = (payload) => {
   return null;
 };
 
+const validateGuidePayload = (body = {}) => {
+  const topic = String(body.topic || "").trim();
+  const question = String(body.question || "").trim();
+  const context = String(body.context || "").trim();
+
+  if (!topic) {
+    return { error: "Missing learning topic." };
+  }
+
+  if (!question) {
+    return { error: "Ask a question before requesting AI guidance." };
+  }
+
+  if (question.length > 1500 || context.length > 4000) {
+    return { error: "The learning request is too large." };
+  }
+
+  return { topic, question, context };
+};
+
 const resolveProvider = () => {
   const requestedProvider = String(process.env.AI_PROVIDER || "").trim().toLowerCase();
   if (requestedProvider && PROVIDERS[requestedProvider]?.apiKey) {
@@ -222,7 +242,7 @@ const tryParseJson = (content) => {
   }
 };
 
-const requestProviderAnalysis = async (provider, state) => {
+const requestProviderChat = async (provider, messages, options = {}) => {
   const response = await fetch(provider.url, {
     method: "POST",
     headers: {
@@ -232,19 +252,9 @@ const requestProviderAnalysis = async (provider, state) => {
     },
     body: JSON.stringify({
       model: provider.defaultModel,
-      temperature: 0.3,
-      response_format: { type: "json_object" },
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a tournament-level One Piece TCG strategic assistant. Give concise, grounded analysis and output JSON only.",
-        },
-        {
-          role: "user",
-          content: buildPrompt(state),
-        },
-      ],
+      temperature: options.temperature ?? 0.3,
+      messages,
+      ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
     }),
   });
 
@@ -259,13 +269,107 @@ const requestProviderAnalysis = async (provider, state) => {
     throw error;
   }
 
-  const content = data?.choices?.[0]?.message?.content;
+  return data?.choices?.[0]?.message?.content || "";
+};
+
+const requestProviderAnalysis = async (provider, state) => {
+  const content = await requestProviderChat(
+    provider,
+    [
+      {
+        role: "system",
+        content:
+          "You are a tournament-level One Piece TCG strategic assistant. Give concise, grounded analysis and output JSON only.",
+      },
+      {
+        role: "user",
+        content: buildPrompt(state),
+      },
+    ],
+    {
+      temperature: 0.3,
+      responseFormat: { type: "json_object" },
+    },
+  );
+
   const analysis = tryParseJson(content);
   if (!analysis) {
     throw new Error(`${provider.label} returned an unreadable analysis payload.`);
   }
 
   return analysis;
+};
+
+const buildGuidePrompt = ({ topic, context, question }) => `
+You are a One Piece TCG learning coach inside the DeckLab Learning Guide.
+
+Topic: ${topic}
+
+Relevant page context:
+${context || "No extra page context supplied."}
+
+User question:
+${question}
+
+Instructions:
+- Answer like a strong coach, not a vague chatbot.
+- Keep the answer practical and easy to apply in a game.
+- If the user is asking for a decision, explain the best line first.
+- If useful, give 3 short next steps or checks.
+- If the question depends on hidden information, say what assumption you are making.
+- Do not mention being an AI model.
+- Use plain text only.
+`.trim();
+
+const getGuideAssistance = async (req, res) => {
+  const provider = resolveProvider();
+  if (!provider) {
+    return res.status(503).json({
+      message:
+        "No AI provider is configured. Add GROQ_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY on the backend.",
+    });
+  }
+
+  const payload = validateGuidePayload(req.body);
+  if (payload.error) {
+    return res.status(400).json({ message: payload.error });
+  }
+
+  try {
+    const answer = await requestProviderChat(
+      provider,
+      [
+        {
+          role: "system",
+          content:
+            "You are a patient, strong One Piece TCG coach helping a user learn decisions, matchups, sequencing, and practice spots.",
+        },
+        {
+          role: "user",
+          content: buildGuidePrompt(payload),
+        },
+      ],
+      {
+        temperature: 0.5,
+      },
+    );
+
+    if (!String(answer || "").trim()) {
+      return res.status(502).json({
+        message: `${provider.label} returned an empty learning response.`,
+      });
+    }
+
+    return res.json({
+      provider: provider.name,
+      model: provider.defaultModel,
+      answer: String(answer).trim(),
+    });
+  } catch (error) {
+    return res.status(error?.statusCode || 500).json({
+      message: error?.message || "Learning guide AI request failed.",
+    });
+  }
 };
 
 const getCoachAnalysis = async (req, res) => {
@@ -300,4 +404,5 @@ const getCoachAnalysis = async (req, res) => {
 
 module.exports = {
   getCoachAnalysis,
+  getGuideAssistance,
 };
