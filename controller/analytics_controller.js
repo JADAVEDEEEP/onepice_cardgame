@@ -4,6 +4,7 @@ const tournamentsDb = require("../model/tournaments_db");
 const savedDeckDb = require("../model/saved_decks_db");
 const mongoose = require("mongoose");
 const { cacheGetJson, cacheSetJson } = require("../config/cache");
+const { resolveProvider, requestProviderChat } = require("./ai_controller");
 
 // Yeh helper kisi bhi numeric value ko safe number me convert karta hai.
 const parseNumber = (value, fallback = 0) => {
@@ -34,6 +35,21 @@ const ANALYTICS_OPTIMIZE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.A
 const ANALYTICS_GENERATE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_GENERATE_CACHE_TTL_MS, 120_000));
 const ANALYTICS_COLOR_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_COLOR_CACHE_TTL_MS, 120_000));
 const ANALYTICS_PROFILE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_PROFILE_CACHE_TTL_MS, 60_000));
+
+const tryParseJsonObject = (value) => {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    const match = value.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]);
+    } catch (nestedError) {
+      return null;
+    }
+  }
+};
 
 // Yeh helper standings se top meta leaders nikalta hai (DB-driven, no static list).
 const buildMetaLeaderRowsFromStandings = ({ standings, cards }) => {
@@ -595,6 +611,157 @@ const generateDeckFromPool = ({ pool, deckSize, playstyle, riskMode, metaContext
     .sort((a, b) => a.cost - b.cost || b.count - a.count);
 
   return { deckCards, total };
+};
+
+const rebalanceGeneratedDeck = ({ aiDeckCards, seedDeckCards, deckSize }) => {
+  const seedByCode = new Map(seedDeckCards.map((card) => [card.code, card]));
+  const orderedSeedCodes = seedDeckCards.map((card) => card.code);
+  const draft = [];
+  const used = new Set();
+
+  for (const item of Array.isArray(aiDeckCards) ? aiDeckCards : []) {
+    const code = String(item?.code || "").trim();
+    if (!code || used.has(code) || !seedByCode.has(code)) continue;
+    const count = clamp(parseNumber(item?.count, 0), 0, 4);
+    if (!count) continue;
+    const seed = seedByCode.get(code);
+    draft.push({
+      ...seed,
+      count,
+      role: String(item?.role || seed.role || "").trim() || seed.role,
+    });
+    used.add(code);
+  }
+
+  if (draft.length === 0) return seedDeckCards;
+
+  let total = draft.reduce((sum, card) => sum + card.count, 0);
+
+  if (total > deckSize) {
+    for (let i = draft.length - 1; i >= 0 && total > deckSize; i -= 1) {
+      while (draft[i].count > 1 && total > deckSize) {
+        draft[i].count -= 1;
+        total -= 1;
+      }
+    }
+  }
+
+  if (total < deckSize) {
+    for (const code of orderedSeedCodes) {
+      if (total >= deckSize) break;
+      const existing = draft.find((card) => card.code === code);
+      if (existing) {
+        while (existing.count < 4 && total < deckSize) {
+          existing.count += 1;
+          total += 1;
+        }
+      } else {
+        const seed = seedByCode.get(code);
+        if (!seed) continue;
+        draft.push({ ...seed, count: 1 });
+        total += 1;
+      }
+    }
+  }
+
+  return draft
+    .filter((card) => card.count > 0)
+    .sort((a, b) => a.cost - b.cost || b.count - a.count);
+};
+
+const refineGeneratedDeckWithAI = async ({
+  color,
+  colorList,
+  playstyle,
+  riskMode,
+  metaContext,
+  deckSize,
+  selectedLeader,
+  seedDeckCards,
+  matchupPreview,
+}) => {
+  const provider = resolveProvider();
+  if (!provider) return null;
+
+  const prompt = `
+You are a high-level One Piece TCG deckbuilding assistant inside DeckLab.
+
+Your job:
+- Refine a seed decklist into a stronger "best deck" recommendation.
+- Keep the leader/color logic from the app unchanged.
+- Only use the candidate cards already provided.
+- Return valid JSON only.
+
+Inputs:
+- Color request: ${colorList.join("/") || color}
+- Playstyle: ${playstyle}
+- Risk mode: ${riskMode}
+- Meta context: ${metaContext}
+- Deck size target: ${deckSize}
+- Leader: ${selectedLeader ? `${selectedLeader.name} (${selectedLeader.card_code})` : "Auto-selected best leader"}
+- Matchup preview leaders: ${matchupPreview.map((item) => `${item.leader} ${item.winRate}%`).join(", ")}
+
+Candidate seed deck:
+${seedDeckCards
+  .map((card) => `- ${card.code} | ${card.name} | count ${card.count} | role ${card.role} | cost ${card.cost} | power ${card.power} | counter ${card.counter}`)
+  .join("\n")}
+
+Return this JSON shape exactly:
+{
+  "tags": ["tag1", "tag2", "tag3"],
+  "insights": ["insight 1", "insight 2", "insight 3", "insight 4"],
+  "deckCards": [
+    { "code": "OP01-001", "count": 4, "role": "Starter" }
+  ]
+}
+
+Rules:
+- deckCards must use only codes from the candidate seed deck.
+- counts should be between 1 and 4.
+- Aim for exactly ${deckSize} cards total.
+- Prefer practical competitive tuning, not flavor.
+- insights should explain why this refined deck is strong for the requested playstyle/meta.
+`.trim();
+
+  try {
+    const content = await requestProviderChat(
+      provider,
+      [
+        {
+          role: "system",
+          content:
+            "You are a precise One Piece TCG deckbuilding analyst. Return JSON only.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      {
+        temperature: 0.4,
+        responseFormat: { type: "json_object" },
+      },
+    );
+
+    const parsed = tryParseJsonObject(content);
+    if (!parsed || !Array.isArray(parsed.deckCards)) return null;
+
+    return {
+      provider: provider.name,
+      model: provider.defaultModel,
+      deckCards: rebalanceGeneratedDeck({
+        aiDeckCards: parsed.deckCards,
+        seedDeckCards,
+        deckSize,
+      }),
+      tags: Array.isArray(parsed.tags) ? parsed.tags.filter(Boolean).slice(0, 4) : [],
+      insights: Array.isArray(parsed.insights)
+        ? parsed.insights.filter(Boolean).slice(0, 5)
+        : [],
+    };
+  } catch (error) {
+    return null;
+  }
 };
 
 // Yeh helper card pool fallback se color-wise high-level stats banata hai.
@@ -1349,46 +1516,12 @@ const generateBestDeck = async (req, res) => {
       leaders.sort((a, b) => b.power - a.power)[0] ||
       null;
 
-    const { deckCards } = generateDeckFromPool({
+    const { deckCards: seedDeckCards } = generateDeckFromPool({
       pool: colorPool,
       deckSize,
       playstyle,
       riskMode,
       metaContext,
-    });
-
-    const total = deckCards.reduce((s, c) => s + c.count, 0) || 1;
-    const eventCount = deckCards.filter((c) => c.role === "Removal").reduce((s, c) => s + c.count, 0);
-    const blockerCount = deckCards.filter((c) => c.role === "Blocker").reduce((s, c) => s + c.count, 0);
-    const lowCost = deckCards.filter((c) => c.cost <= 3).reduce((s, c) => s + c.count, 0);
-    const avgCost = deckCards.reduce((s, c) => s + c.cost * c.count, 0) / total;
-    const counterDensity = Math.round((deckCards.reduce((s, c) => s + (c.counter > 0 ? c.count : 0), 0) / total) * 100);
-
-    const optimizationScore = clamp(
-      Math.round(
-        35 +
-          Math.min(25, lowCost * 0.5) +
-          Math.min(15, blockerCount * 1.5) +
-          Math.min(15, eventCount * 1.1) +
-          Math.min(10, counterDensity * 0.08)
-      )
-    );
-
-    const analytics = {
-      consistency: clamp(Math.round(65 + counterDensity * 0.2)),
-      tempo: clamp(Math.round(55 + (lowCost / total) * 100 * 0.5)),
-      control: clamp(Math.round(45 + (eventCount / total) * 100 * 1.2)),
-      lateGame: clamp(Math.round(50 + deckCards.filter((c) => c.cost >= 7).reduce((s, c) => s + c.count, 0) * 3)),
-      brickRisk: clamp(Math.round(22 - lowCost * 0.4), 5, 50),
-      counterDensity,
-    };
-
-    const curveMap = new Map();
-    for (const card of deckCards) curveMap.set(card.cost, (curveMap.get(card.cost) || 0) + card.count);
-    const curve = Array.from({ length: 9 }).map((_, idx) => {
-      const cost = idx < 8 ? idx + 1 : "9+";
-      const count = idx < 8 ? curveMap.get(idx + 1) || 0 : deckCards.filter((c) => c.cost >= 9).reduce((s, c) => s + c.count, 0);
-      return { cost, count };
     });
 
     const colorTagLabel = colorList.join("/");
@@ -1408,11 +1541,62 @@ const generateBestDeck = async (req, res) => {
       const placementAdjust = Math.round((10 - Math.min(10, meta.avgPlacement || 10)) * 0.4);
       return {
         leader: meta.leader,
-        winRate: clamp(50 + Math.round((optimizationScore - 60) * 0.2) + colorAdjust - metaStrengthAdjust + sampleAdjust + placementAdjust, 35, 75),
+        winRate: clamp(58 + colorAdjust - metaStrengthAdjust + sampleAdjust + placementAdjust, 35, 75),
       };
     });
 
-    const insights = [
+    const aiRefined = await refineGeneratedDeckWithAI({
+      color,
+      colorList,
+      playstyle,
+      riskMode,
+      metaContext,
+      deckSize,
+      selectedLeader,
+      seedDeckCards,
+      matchupPreview,
+    });
+
+    const deckCards = aiRefined?.deckCards || seedDeckCards;
+    const total = deckCards.reduce((s, c) => s + c.count, 0) || 1;
+    const eventCount = deckCards.filter((c) => c.role === "Removal").reduce((s, c) => s + c.count, 0);
+    const blockerCount = deckCards.filter((c) => c.role === "Blocker").reduce((s, c) => s + c.count, 0);
+    const lowCost = deckCards.filter((c) => c.cost <= 3).reduce((s, c) => s + c.count, 0);
+    const avgCost = deckCards.reduce((s, c) => s + c.cost * c.count, 0) / total;
+    const counterDensity = Math.round((deckCards.reduce((s, c) => s + (c.counter > 0 ? c.count : 0), 0) / total) * 100);
+    const finisherCount = deckCards.filter((c) => c.cost >= 7).reduce((s, c) => s + c.count, 0);
+
+    const optimizationScore = clamp(
+      Math.round(
+        35 +
+          Math.min(25, lowCost * 0.5) +
+          Math.min(15, blockerCount * 1.5) +
+          Math.min(15, eventCount * 1.1) +
+          Math.min(10, counterDensity * 0.08) +
+          (aiRefined ? 4 : 0)
+      )
+    );
+
+    const analytics = {
+      consistency: clamp(Math.round(65 + counterDensity * 0.2)),
+      tempo: clamp(Math.round(55 + (lowCost / total) * 100 * 0.5)),
+      control: clamp(Math.round(45 + (eventCount / total) * 100 * 1.2)),
+      lateGame: clamp(Math.round(50 + finisherCount * 3)),
+      brickRisk: clamp(Math.round(22 - lowCost * 0.4), 5, 50),
+      counterDensity,
+    };
+
+    const curveMap = new Map();
+    for (const card of deckCards) curveMap.set(card.cost, (curveMap.get(card.cost) || 0) + card.count);
+    const curve = Array.from({ length: 9 }).map((_, idx) => {
+      const cost = idx < 8 ? idx + 1 : "9+";
+      const count = idx < 8 ? curveMap.get(idx + 1) || 0 : deckCards.filter((c) => c.cost >= 9).reduce((s, c) => s + c.count, 0);
+      return { cost, count };
+    });
+
+    const insights = aiRefined?.insights?.length
+      ? aiRefined.insights
+      : [
       `Curve tuned for ${playstyle} profile with avg cost ${avgCost.toFixed(1)}.`,
       `Counter density at ${counterDensity}% for defensive stability.`,
       `Event/removal package includes ${eventCount} slots for board interaction.`,
@@ -1424,13 +1608,15 @@ const generateBestDeck = async (req, res) => {
       leader: selectedLeader
         ? { name: selectedLeader.name, code: selectedLeader.card_code, image_url: selectedLeader.image_url }
         : null,
-      tags: [playstyle, riskMode, colorTagLabel || color],
+      tags: aiRefined?.tags?.length ? aiRefined.tags : [playstyle, riskMode, colorTagLabel || color],
       optimizationScore,
       analytics,
       deckCards,
       insights,
       curve,
       matchupPreview,
+      generationMode: aiRefined ? "ai-refined" : "heuristic",
+      generationProvider: aiRefined?.provider || null,
       generated_at: new Date().toISOString(),
     };
     await cacheSetJson(cacheKey, response, ANALYTICS_GENERATE_CACHE_TTL_MS);

@@ -405,4 +405,6 @@ const getCoachAnalysis = async (req, res) => {
 module.exports = {
   getCoachAnalysis,
   getGuideAssistance,
+  resolveProvider,
+  requestProviderChat,
 };
