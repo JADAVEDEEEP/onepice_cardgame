@@ -22,6 +22,9 @@ const connectDB = async () => {
         serverSelectionTimeoutMS: 30000,
         connectTimeoutMS: 30000,
         socketTimeoutMS: 45000,
+        maxPoolSize: Math.max(5, Number(process.env.MONGO_MAX_POOL_SIZE) || 20),
+        minPoolSize: Math.max(0, Number(process.env.MONGO_MIN_POOL_SIZE) || 5),
+        maxIdleTimeMS: Math.max(10_000, Number(process.env.MONGO_MAX_IDLE_TIME_MS) || 60_000),
         family: 4,
       });
       console.log(`MongoDB Connected (db: ${dbName})`);

@@ -38,6 +38,8 @@ const matchupDatasetSchema = new mongoose.Schema(
   { timestamps: true, strict: false }
 );
 
+matchupDatasetSchema.index({ updatedAt: -1, createdAt: -1 });
+
 module.exports = mongoose.model(
   "MatchupDataset",
   matchupDatasetSchema,

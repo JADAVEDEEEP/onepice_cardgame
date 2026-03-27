@@ -13,6 +13,11 @@ const standingsSchema = new mongoose.Schema(
   { strict: false }
 );
 
+standingsSchema.index({ deck: 1 });
+standingsSchema.index({ format: 1, date: 1 });
+standingsSchema.index({ tournament: 1, date: 1, format: 1 });
+standingsSchema.index({ date: 1 });
+
 module.exports = mongoose.model(
   "Standing",
   standingsSchema,

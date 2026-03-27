@@ -12,7 +12,7 @@ const getCards = async (req, res) => {
     if (cached) return res.json(cached);
 
     // Yahan cards collection par simple find() chalaya gaya hai.
-    const cards = await cards_db.find();
+    const cards = await cards_db.find().lean();
     await cacheSetJson(cacheKey, cards, CARDS_CACHE_TTL_MS);
     // Yahan final cards list response me return ho rahi hai.
     return res.json(cards);

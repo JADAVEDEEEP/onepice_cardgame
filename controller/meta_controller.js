@@ -91,8 +91,14 @@ const getBestDeck = async (req, res) => {
 
     // Dono collections parallel me fetch kar rahe hain performance ke liye
     const [standings, tournaments] = await Promise.all([
-      standingsDb.find(standingsQuery).lean(),
-      tournamentsDb.find(tournamentsQuery).lean(),
+      standingsDb
+        .find(standingsQuery)
+        .select("tournament date format placement deck")
+        .lean(),
+      tournamentsDb
+        .find(tournamentsQuery)
+        .select("name date format region country players")
+        .lean(),
     ]);
 
     // Tournament lookup maps ban rahe hain fast matching ke liye
@@ -340,7 +346,10 @@ const getDeckDetails = async (req, res) => {
     }
 
     // Matching standings rows fetch
-    const standings = await standingsDb.find(standingsQuery).lean();
+    const standings = await standingsDb
+      .find(standingsQuery)
+      .select("deck tournament date format placement player")
+      .lean();
 
     // No data found case
     if (standings.length === 0) {
@@ -355,6 +364,7 @@ const getDeckDetails = async (req, res) => {
     // Tournament docs fetch using raw tournament names
     const tournaments = await tournamentsDb
       .find({ name: { $in: standings.map((row) => row.tournament).filter(Boolean) } })
+      .select("name date format region country players link")
       .lean();
 
     // Quick tournament lookup map

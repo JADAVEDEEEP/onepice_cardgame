@@ -1,6 +1,7 @@
 //importing the required modules so we can use their moudueles fucnality in our code
 require("dotenv").config();
 const express = require('express');
+const compression = require("compression");
 const cors = require("cors");
 const cards = require('./routes/card');
 const meta = require('./routes/meta');
@@ -54,6 +55,7 @@ const corsOptions = {
 
 //parssing the incoimg request body as json data in to the javascript object
 app.use(express.json({ limit: "1mb" }));
+app.use(compression());
 app.use(cors(corsOptions));
 app.use(createRateLimiter());
 
@@ -92,10 +94,13 @@ const port = Number(process.env.PORT) || 3000;
 const startServer = async () => {
   try {
     await connectDB();
-    app.listen(port, () => {
+    const server = app.listen(port, () => {
       console.log(`Server is running on port ${port}`);
       startTopicWatcher();
     });
+    server.keepAliveTimeout = Math.max(5_000, Number(process.env.KEEP_ALIVE_TIMEOUT_MS) || 65_000);
+    server.headersTimeout = Math.max(server.keepAliveTimeout + 1_000, Number(process.env.HEADERS_TIMEOUT_MS) || 66_000);
+    server.requestTimeout = Math.max(10_000, Number(process.env.REQUEST_TIMEOUT_MS) || 120_000);
   } catch (error) {
     console.error("Fatal startup error:", error?.message || error);
     process.exit(1);

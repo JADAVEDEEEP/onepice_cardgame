@@ -18,6 +18,9 @@ const metaLeaderSchema = new mongoose.Schema(
   { timestamps: true, strict: false }
 );
 
+metaLeaderSchema.index({ leader: 1 });
+metaLeaderSchema.index({ popularity: -1, winRate: -1 });
+
 module.exports = mongoose.model(
   "MetaLeader",
   metaLeaderSchema,

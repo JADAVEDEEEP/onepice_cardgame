@@ -35,6 +35,10 @@ const ANALYTICS_OPTIMIZE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.A
 const ANALYTICS_GENERATE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_GENERATE_CACHE_TTL_MS, 120_000));
 const ANALYTICS_COLOR_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_COLOR_CACHE_TTL_MS, 120_000));
 const ANALYTICS_PROFILE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_PROFILE_CACHE_TTL_MS, 60_000));
+const ANALYTICS_CARD_FIELDS =
+  "id card_code name colors color category type cost power counter_value counter traits types effect trigger text_effect rarity pack_id set_code img_full_url img_url tournament_status tournamentStatus status legality is_banned banned";
+const ANALYTICS_STANDING_FIELDS = "tournament date format placement player deck leaderImage";
+const ANALYTICS_TOURNAMENT_FIELDS = "date region country name format players winner link";
 
 const tryParseJsonObject = (value) => {
   if (typeof value !== "string" || !value.trim()) return null;
@@ -1270,8 +1274,8 @@ const getMatchupMatrix = async (req, res) => {
     }
 
     const [standings, cardsRaw] = await Promise.all([
-      standingsDb.find(standingsQuery).lean(),
-      cardsDb.find({}).lean(),
+      standingsDb.find(standingsQuery).select(ANALYTICS_STANDING_FIELDS).lean(),
+      cardsDb.find({}).select(ANALYTICS_CARD_FIELDS).lean(),
     ]);
     const cardsByCode = new Map(
       cardsRaw.filter(isCardActive).map(toInternalCard).map((card) => [card.card_code, card])
@@ -1356,7 +1360,7 @@ const getSavedDeckProfile = async (req, res) => {
 
     const [savedDeck, cardsRaw] = await Promise.all([
       savedDeckDb.findById(deckId).lean(),
-      cardsDb.find({}).lean(),
+      cardsDb.find({}).select(ANALYTICS_CARD_FIELDS).lean(),
     ]);
     if (!savedDeck) return res.status(404).json({ message: "Saved deck not found" });
 
@@ -1417,9 +1421,9 @@ const bestColorFinder = async (req, res) => {
     }
 
     let [cardsRaw, standings, tournaments] = await Promise.all([
-      cardsDb.find({}).lean(),
-      standingsDb.find(standingsQuery).lean(),
-      tournamentsDb.find(tournamentsQuery).lean(),
+      cardsDb.find({}).select(ANALYTICS_CARD_FIELDS).lean(),
+      standingsDb.find(standingsQuery).select(ANALYTICS_STANDING_FIELDS).lean(),
+      tournamentsDb.find(tournamentsQuery).select(ANALYTICS_TOURNAMENT_FIELDS).lean(),
     ]);
 
     // Agar selected window me data na mile to date filter hata kar broader meta try karo.
@@ -1431,8 +1435,8 @@ const bestColorFinder = async (req, res) => {
         broaderTournamentsQuery.format = requestedFormat.toUpperCase();
       }
       [standings, tournaments] = await Promise.all([
-        standingsDb.find(broaderStandingsQuery).lean(),
-        tournamentsDb.find(broaderTournamentsQuery).lean(),
+        standingsDb.find(broaderStandingsQuery).select(ANALYTICS_STANDING_FIELDS).lean(),
+        tournamentsDb.find(broaderTournamentsQuery).select(ANALYTICS_TOURNAMENT_FIELDS).lean(),
       ]);
     }
 
@@ -1497,7 +1501,10 @@ const generateBestDeck = async (req, res) => {
     const cached = await cacheGetJson(cacheKey);
     if (cached) return res.json(cached);
 
-    const [cardsRaw, standingsRaw] = await Promise.all([cardsDb.find({}).lean(), standingsDb.find({}).lean()]);
+    const [cardsRaw, standingsRaw] = await Promise.all([
+      cardsDb.find({}).select(ANALYTICS_CARD_FIELDS).lean(),
+      standingsDb.find({}).select(ANALYTICS_STANDING_FIELDS).lean(),
+    ]);
     const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
     const matchesRequestedColor = (cardColor) =>
       colorList.some((col) => normalizeText(cardColor).includes(col));
@@ -1649,7 +1656,10 @@ const optimizeDeck = async (req, res) => {
     const cached = await cacheGetJson(cacheKey);
     if (cached) return res.json(cached);
 
-    const [cardsRaw, standingsRaw] = await Promise.all([cardsDb.find({}).lean(), standingsDb.find({}).lean()]);
+    const [cardsRaw, standingsRaw] = await Promise.all([
+      cardsDb.find({}).select(ANALYTICS_CARD_FIELDS).lean(),
+      standingsDb.find({}).select(ANALYTICS_STANDING_FIELDS).lean(),
+    ]);
     const activeCards = cardsRaw.filter(isCardActive).map(toInternalCard);
     const allCardsByCode = new Map(activeCards.map((card) => [card.card_code, card]));
     const metaLeaders = buildMetaLeaderRowsFromStandings({ standings: standingsRaw, cards: activeCards });

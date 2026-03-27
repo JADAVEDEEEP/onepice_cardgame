@@ -14,6 +14,11 @@ const tournamentSchema = new mongoose.Schema(
   { strict: false }
 );
 
+tournamentSchema.index({ name: 1 });
+tournamentSchema.index({ format: 1, date: 1 });
+tournamentSchema.index({ region: 1, country: 1, date: 1 });
+tournamentSchema.index({ name: 1, format: 1, date: 1 });
+
 module.exports = mongoose.model(
   "Tournament",
   tournamentSchema,

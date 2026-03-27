@@ -1,5 +1,8 @@
 const decklistDb = require("../model/decklist_db");
 const cardsDb = require("../model/cards_db");
+const { cacheGetJson, cacheSetJson } = require("../config/cache");
+
+const DECKLIST_CACHE_TTL_MS = Math.max(5_000, Number(process.env.DECKLIST_CACHE_TTL_MS) || 120_000);
 
 const parseNumber = (value, fallback) => {
   const parsed = Number(value);
@@ -93,8 +96,23 @@ const listDecklists = async (req, res) => {
     if (leader) query.leader = leader;
     if (setName) query.setName = setName;
 
+    const cacheKey = `decklists:${JSON.stringify({
+      leader: leader || null,
+      setName: setName || null,
+      page,
+      limit,
+    })}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
+
     const [decklists, total] = await Promise.all([
-      decklistDb.find(query).sort({ leader: 1, card_id: 1 }).skip(skip).limit(limit).lean(),
+      decklistDb
+        .find(query)
+        .sort({ leader: 1, card_id: 1 })
+        .skip(skip)
+        .limit(limit)
+        .select("leader card_id image leaderCard setName leaderWinRate totalDecklists decklists url")
+        .lean(),
       decklistDb.countDocuments(query),
     ]);
 
@@ -119,7 +137,7 @@ const listDecklists = async (req, res) => {
     const cardLookup = buildCardLookup(cards);
     const enrichedDecklists = decklists.map((record) => enrichDecklistRecord(record, cardLookup));
 
-    return res.json({
+    const response = {
       decklists: enrichedDecklists,
       count: enrichedDecklists.length,
       pagination: {
@@ -134,7 +152,10 @@ const listDecklists = async (req, res) => {
         leader: leader || null,
         setName: setName || null,
       },
-    });
+    };
+
+    await cacheSetJson(cacheKey, response, DECKLIST_CACHE_TTL_MS);
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({
       message: "Failed to fetch decklists",

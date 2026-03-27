@@ -1,5 +1,8 @@
 const metaLeaderDb = require("../model/meta_leader_db");
 const cardsDb = require("../model/cards_db");
+const { cacheGetJson, cacheSetJson } = require("../config/cache");
+
+const META_LEADERS_CACHE_TTL_MS = Math.max(5_000, Number(process.env.META_LEADERS_CACHE_TTL_MS) || 120_000);
 
 const normalizeLeaderCode = (value) => String(value || "").trim().replace(/^1x/i, "");
 const escapeRegex = (value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -143,15 +146,26 @@ const findLeaderDocument = async (leaderCode) => {
 
 const listMetaLeaders = async (req, res) => {
   try {
-    const leaders = await metaLeaderDb.find().sort({ popularity: -1, winRate: -1 }).lean();
+    const cacheKey = "meta:leaders:list";
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
+
+    const leaders = await metaLeaderDb
+      .find()
+      .sort({ popularity: -1, winRate: -1 })
+      .select("leader winRate popularity number_of_matches avgDuration totalCards setName")
+      .lean();
     const leaderCodes = leaders.map((leader) => normalizeLeaderCode(leader?.leader)).filter(Boolean);
     const leaderCards = await cardsDb.find({ id: { $in: leaderCodes } }).select("id name effect img_url img_full_url colors").lean();
     const leaderCardLookup = buildCardLookup(leaderCards);
 
-    return res.json({
+    const response = {
       leaders: leaders.map((leader) => buildLeaderSummary(leader, leaderCardLookup.get(normalizeLeaderCode(leader?.leader)))),
       count: leaders.length,
-    });
+    };
+
+    await cacheSetJson(cacheKey, response, META_LEADERS_CACHE_TTL_MS);
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({ message: "Failed to fetch meta leaders", error: error.message });
   }
@@ -161,6 +175,10 @@ const getMetaLeaderByCode = async (req, res) => {
   try {
     const leaderCode = normalizeLeaderCode(req.params?.leaderCode);
     if (!leaderCode) return res.status(400).json({ message: "leaderCode is required" });
+
+    const cacheKey = `meta:leaders:${leaderCode}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
 
     const leader = await findLeaderDocument(leaderCode);
     if (!leader) return res.status(404).json({ message: "Meta leader not found" });
@@ -179,6 +197,7 @@ const getMetaLeaderByCode = async (req, res) => {
 
     const cardLookup = buildCardLookup(cards);
     const response = buildLeaderDetail(leader, cardLookup.get(leaderCode), cardLookup);
+    await cacheSetJson(cacheKey, response, META_LEADERS_CACHE_TTL_MS);
     return res.json(response);
   } catch (error) {
     return res.status(500).json({ message: "Failed to fetch meta leader", error: error.message });

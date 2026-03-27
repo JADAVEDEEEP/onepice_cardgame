@@ -27,6 +27,10 @@ const decklistSchema = new mongoose.Schema(
   { timestamps: true, strict: false }
 );
 
+decklistSchema.index({ leader: 1, card_id: 1 });
+decklistSchema.index({ setName: 1 });
+decklistSchema.index({ leader: 1, setName: 1 });
+
 module.exports = mongoose.model(
   "Decklist",
   decklistSchema,

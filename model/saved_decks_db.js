@@ -22,9 +22,11 @@ const savedDeckSchema = new mongoose.Schema(
   { timestamps: true, strict: false }
 );
 
+savedDeckSchema.index({ createdAt: -1 });
+savedDeckSchema.index({ "leader.card_code": 1, createdAt: -1 });
+
 module.exports = mongoose.model(
   "SavedDeck",
   savedDeckSchema,
   process.env.SAVED_DECKS_COLLECTION || "onepice_game_saved_decks"
 );
-

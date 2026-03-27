@@ -1,5 +1,8 @@
 const matchupsDb = require("../model/matchups_db");
 const cardsDb = require("../model/cards_db");
+const { cacheGetJson, cacheSetJson } = require("../config/cache");
+
+const MATCHUPS_CACHE_TTL_MS = Math.max(5_000, Number(process.env.MATCHUPS_CACHE_TTL_MS) || 120_000);
 
 const normalizeLeaderCode = (value) => String(value || "").trim().replace(/^1x/i, "");
 const parseNumber = (value, fallback = 0) => {
@@ -92,6 +95,10 @@ const enrichLeader = (req, item, cardLookup) => {
 
 const getMatchups = async (req, res) => {
   try {
+    const cacheKey = "matchups:latest";
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
+
     const dataset = await matchupsDb.findOne().sort({ updatedAt: -1, createdAt: -1 }).lean();
     if (!dataset) {
       return res.status(404).json({ message: "Matchup dataset not found" });
@@ -118,12 +125,15 @@ const getMatchups = async (req, res) => {
 
     const cardLookup = buildCardLookup(cards);
 
-    return res.json({
+    const response = {
       _id: dataset?._id,
       total_matches: parseNumber(dataset?.total_matches, 0),
       matchups: leaders.map((leader) => enrichLeader(req, leader, cardLookup)),
       count: leaders.length,
-    });
+    };
+
+    await cacheSetJson(cacheKey, response, MATCHUPS_CACHE_TTL_MS);
+    return res.json(response);
   } catch (error) {
     return res.status(500).json({ message: "Failed to fetch matchups", error: error.message });
   }
