@@ -1,6 +1,7 @@
 const nodemailer = require("nodemailer");
 const { load } = require("cheerio");
 const TopicAlertState = require("../model/topic_alert_state_db");
+const { resolveProvider, requestProviderChat } = require("../controller/ai_controller");
 
 const TOPICS_URL =
   process.env.TOPICS_WATCH_URL || "https://en.onepiece-cardgame.com/topics/";
@@ -113,6 +114,181 @@ const extractTopicPosts = (html) => {
   return posts;
 };
 
+const escapeHtml = (value) =>
+  String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+const tryParseJson = (value) => {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    const match = value.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]);
+    } catch (nestedError) {
+      return null;
+    }
+  }
+};
+
+const buildWatcherEmailFallback = (posts) => {
+  const subject =
+    posts.length === 1
+      ? `[OPTCG Alert] New topic: ${posts[0].title}`
+      : `[OPTCG Alert] ${posts.length} new topics posted`;
+
+  const textLines = posts.map(
+    (p, idx) =>
+      `${idx + 1}. ${p.title}\nDate: ${p.published_at || "N/A"}\nSummary: ${p.summary}\nLink: ${p.url}`
+  );
+
+  const htmlItems = posts
+    .map(
+      (p) => `
+      <li style="margin-bottom:12px;">
+        <strong>${escapeHtml(p.title)}</strong><br/>
+        <span>Date: ${escapeHtml(p.published_at || "N/A")}</span><br/>
+        <span>${escapeHtml(p.summary)}</span><br/>
+        <a href="${escapeHtml(p.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(p.url)}</a>
+      </li>`
+    )
+    .join("");
+
+  return {
+    subject,
+    text: textLines.join("\n\n"),
+    html: `<div><p>New One Piece Card Game topics detected:</p><ol>${htmlItems}</ol></div>`,
+    aiUsed: false,
+  };
+};
+
+const buildWatcherEmailWithAI = async (posts) => {
+  const provider = resolveProvider();
+  if (!provider || posts.length === 0) {
+    return buildWatcherEmailFallback(posts);
+  }
+
+  const prompt = `
+You are preparing an email alert for new One Piece Card Game official topic posts.
+
+Posts:
+${posts
+  .map(
+    (post, index) =>
+      `${index + 1}. Title: ${post.title}\nDate: ${post.published_at || "N/A"}\nSummary: ${post.summary}\nLink: ${post.url}`
+  )
+  .join("\n\n")}
+
+Return JSON with exactly this shape:
+{
+  "subject": "short subject line",
+  "intro": "2 sentence intro",
+  "highlights": [
+    {
+      "title": "post title",
+      "whyItMatters": "short reason",
+      "summary": "short summary"
+    }
+  ]
+}
+
+Rules:
+- Keep subject concise and email friendly.
+- highlights length must match number of posts.
+- whyItMatters should tell a player why they should care.
+- summary should be short and natural.
+- Return JSON only.
+`.trim();
+
+  try {
+    const content = await requestProviderChat(
+      provider,
+      [
+        {
+          role: "system",
+          content:
+            "You write concise alert emails for One Piece TCG event and topic updates. Return JSON only.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      {
+        temperature: 0.4,
+        responseFormat: { type: "json_object" },
+      }
+    );
+
+    const parsed = tryParseJson(content);
+    if (!parsed || !Array.isArray(parsed.highlights)) {
+      return buildWatcherEmailFallback(posts);
+    }
+
+    const intro = String(parsed.intro || "New One Piece Card Game topics were detected.").trim();
+    const subject =
+      String(parsed.subject || "").trim() ||
+      (posts.length === 1
+        ? `[OPTCG Alert] ${posts[0].title}`
+        : `[OPTCG Alert] ${posts.length} new One Piece updates`);
+
+    const highlights = posts.map((post, index) => {
+      const aiItem = parsed.highlights[index] || {};
+      return {
+        title: String(aiItem.title || post.title).trim() || post.title,
+        whyItMatters: String(aiItem.whyItMatters || "Official update detected.").trim(),
+        summary: String(aiItem.summary || post.summary).trim() || post.summary,
+        url: post.url,
+        published_at: post.published_at || "N/A",
+      };
+    });
+
+    const text = [
+      intro,
+      "",
+      ...highlights.map(
+        (item, index) =>
+          `${index + 1}. ${item.title}\nDate: ${item.published_at}\nWhy it matters: ${item.whyItMatters}\nSummary: ${item.summary}\nLink: ${item.url}`
+      ),
+    ].join("\n");
+
+    const html = `
+      <div>
+        <p>${escapeHtml(intro)}</p>
+        <ol>
+          ${highlights
+            .map(
+              (item) => `
+                <li style="margin-bottom:12px;">
+                  <strong>${escapeHtml(item.title)}</strong><br/>
+                  <span>Date: ${escapeHtml(item.published_at)}</span><br/>
+                  <span><strong>Why it matters:</strong> ${escapeHtml(item.whyItMatters)}</span><br/>
+                  <span>${escapeHtml(item.summary)}</span><br/>
+                  <a href="${escapeHtml(item.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(item.url)}</a>
+                </li>`
+            )
+            .join("")}
+        </ol>
+      </div>`;
+
+    return {
+      subject,
+      text,
+      html,
+      aiUsed: true,
+      provider: provider.name,
+    };
+  } catch (error) {
+    return buildWatcherEmailFallback(posts);
+  }
+};
+
 const sendNewTopicEmail = async (posts) => {
   const user = process.env.MAIL_USER || "deepjadav71691@gmail.com";
   const pass = process.env.MAIL_PASS || "olaonvllisgsdvwa";
@@ -142,42 +318,22 @@ const sendNewTopicEmail = async (posts) => {
       socketTimeout: Math.max(mailTimeoutMs, 20_000),
     });
 
-  const subject =
-    posts.length === 1
-      ? `[OPTCG Alert] New topic: ${posts[0].title}`
-      : `[OPTCG Alert] ${posts.length} new topics posted`;
-
-  const textLines = posts.map(
-    (p, idx) =>
-      `${idx + 1}. ${p.title}\nDate: ${p.published_at || "N/A"}\nSummary: ${p.summary}\nLink: ${p.url}`
-  );
-
-  const htmlItems = posts
-    .map(
-      (p) => `
-      <li style="margin-bottom:12px;">
-        <strong>${p.title}</strong><br/>
-        <span>Date: ${p.published_at || "N/A"}</span><br/>
-        <span>${p.summary}</span><br/>
-        <a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.url}</a>
-      </li>`
-    )
-    .join("");
+  const emailContent = await buildWatcherEmailWithAI(posts);
 
   await withTimeout(transporter.verify(), mailTimeoutMs, "mail_verify_timeout");
   await withTimeout(
     transporter.sendMail({
       from: `"OPTCG Watcher" <${user}>`,
       to,
-      subject,
-      text: textLines.join("\n\n"),
-      html: `<div><p>New One Piece Card Game topics detected:</p><ol>${htmlItems}</ol></div>`,
+      subject: emailContent.subject,
+      text: emailContent.text,
+      html: emailContent.html,
     }),
     Math.max(mailTimeoutMs, 20_000),
     "mail_send_timeout"
   );
 
-  return { sent: true };
+  return { sent: true, aiUsed: emailContent.aiUsed, provider: emailContent.provider || null };
 };
 
 const sendTopicWatcherTestEmail = async () => {

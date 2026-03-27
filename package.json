@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "nodemon index.js",
     "start": "node index.js",
-    "watcher:run-once": "node scripts/run-topic-watcher-once.js"
+    "watcher:run-once": "node scripts/run-topic-watcher-once.js",
+    "meta:import": "node scripts/import-meta-json.js"
   },
   "author": "",
   "license": "ISC",
