@@ -192,6 +192,83 @@ const VERDICT_SCHEMA = {
 
 const VERDICT_SHAPE_GUIDE = JSON.stringify(VERDICT_SCHEMA, null, 2);
 
+const CARD_INTEL_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["summary", "comboPartners", "replacementCards", "weakSpots", "bestFor"],
+  properties: {
+    summary: { type: "string" },
+    comboPartners: {
+      type: "array",
+      minItems: 1,
+      maxItems: 4,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["cardId", "reason"],
+        properties: {
+          cardId: { type: "string" },
+          reason: { type: "string" },
+        },
+      },
+    },
+    replacementCards: {
+      type: "array",
+      minItems: 1,
+      maxItems: 4,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["cardId", "reason"],
+        properties: {
+          cardId: { type: "string" },
+          reason: { type: "string" },
+        },
+      },
+    },
+    weakSpots: {
+      type: "array",
+      minItems: 2,
+      maxItems: 4,
+      items: { type: "string" },
+    },
+    bestFor: { type: "string" },
+  },
+};
+
+const CARD_INTEL_SHAPE_GUIDE = JSON.stringify(CARD_INTEL_SCHEMA, null, 2);
+
+const DECK_UPGRADE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["overview", "improvements", "importCards"],
+  properties: {
+    overview: { type: "string" },
+    improvements: {
+      type: "array",
+      minItems: 3,
+      maxItems: 6,
+      items: { type: "string" },
+    },
+    importCards: {
+      type: "array",
+      minItems: 2,
+      maxItems: 8,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["cardId", "reason"],
+        properties: {
+          cardId: { type: "string" },
+          reason: { type: "string" },
+        },
+      },
+    },
+  },
+};
+
+const DECK_UPGRADE_SHAPE_GUIDE = JSON.stringify(DECK_UPGRADE_SCHEMA, null, 2);
+
 const toInteger = (value, fallback = 0) => {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -296,6 +373,39 @@ const resolveProvider = () => {
   return null;
 };
 
+const resolveProviders = () => {
+  const requestedProvider = String(process.env.AI_PROVIDER || "").trim().toLowerCase();
+  const ordered = [];
+  const seen = new Set();
+
+  const pushProvider = (name) => {
+    if (!name || seen.has(name) || !PROVIDERS[name]?.apiKey) return;
+    seen.add(name);
+    ordered.push({
+      name,
+      ...PROVIDERS[name],
+    });
+  };
+
+  pushProvider(requestedProvider);
+  Object.keys(PROVIDERS).forEach(pushProvider);
+  return ordered;
+};
+
+const shouldRetryWithAnotherProvider = (error) => {
+  const message = String(error?.message || "").toLowerCase();
+  const statusCode = Number(error?.statusCode || 0);
+  return (
+    statusCode === 429 ||
+    statusCode >= 500 ||
+    message.includes("rate limit") ||
+    message.includes("tokens per day") ||
+    message.includes("quota") ||
+    message.includes("capacity") ||
+    message.includes("temporarily unavailable")
+  );
+};
+
 const buildPrompt = (state) => `
 You are an expert One Piece TCG strategy coach helping a player decide the best line in a live match.
 
@@ -357,6 +467,113 @@ const validateVerdictPayload = (payload) => {
   return null;
 };
 
+const sanitizeCardIntelPayload = (body = {}) => ({
+  selectedLeader: body.selectedLeader && typeof body.selectedLeader === "object" ? {
+    id: String(body.selectedLeader.id || body.selectedLeader.number || "").trim(),
+    name: String(body.selectedLeader.name || "").trim(),
+    color: String(body.selectedLeader.color || "").trim(),
+  } : null,
+  selectedCard: body.selectedCard && typeof body.selectedCard === "object" ? {
+    id: String(body.selectedCard.id || body.selectedCard.number || "").trim(),
+    name: String(body.selectedCard.name || "").trim(),
+    type: String(body.selectedCard.type || "").trim(),
+    color: String(body.selectedCard.color || "").trim(),
+    cost: toInteger(body.selectedCard.cost, 0),
+    power: String(body.selectedCard.power || "").trim(),
+    counter: String(body.selectedCard.counter || "").trim(),
+    effect: String(body.selectedCard.effect || "").trim(),
+    trigger: String(body.selectedCard.trigger || "").trim(),
+  } : null,
+  deckCards: Array.isArray(body.deckCards)
+    ? body.deckCards
+        .map((card) => ({
+          id: String(card?.id || card?.number || card?.code || "").trim(),
+          name: String(card?.name || "").trim(),
+          type: String(card?.type || "").trim(),
+          color: String(card?.color || "").trim(),
+          cost: toInteger(card?.cost, 0),
+          power: String(card?.power || "").trim(),
+          counter: String(card?.counter || "").trim(),
+          effect: String(card?.effect || "").trim(),
+        }))
+        .filter((card) => card.id || card.name)
+        .slice(0, 20)
+    : [],
+  candidateCards: Array.isArray(body.candidateCards)
+    ? body.candidateCards
+        .map((card) => ({
+          id: String(card?.id || card?.number || card?.code || "").trim(),
+          name: String(card?.name || "").trim(),
+          type: String(card?.type || "").trim(),
+          color: String(card?.color || "").trim(),
+          cost: toInteger(card?.cost, 0),
+          power: String(card?.power || "").trim(),
+          counter: String(card?.counter || "").trim(),
+          effect: String(card?.effect || "").trim(),
+        }))
+        .filter((card) => card.id || card.name)
+        .slice(0, 40)
+    : [],
+});
+
+const validateCardIntelPayload = (payload) => {
+  if (!payload.selectedCard?.id) {
+    return "Select a card before requesting card intelligence.";
+  }
+  if (payload.candidateCards.length === 0) {
+    return "Candidate cards are required for card intelligence suggestions.";
+  }
+  return null;
+};
+
+const sanitizeDeckUpgradePayload = (body = {}) => ({
+  selectedLeader: body.selectedLeader && typeof body.selectedLeader === "object" ? {
+    id: String(body.selectedLeader.id || body.selectedLeader.number || "").trim(),
+    name: String(body.selectedLeader.name || "").trim(),
+    color: String(body.selectedLeader.color || "").trim(),
+  } : null,
+  deckCards: Array.isArray(body.deckCards)
+    ? body.deckCards
+        .map((card) => ({
+          id: String(card?.id || card?.number || card?.code || "").trim(),
+          name: String(card?.name || "").trim(),
+          type: String(card?.type || "").trim(),
+          color: String(card?.color || "").trim(),
+          cost: toInteger(card?.cost, 0),
+          power: String(card?.power || "").trim(),
+          counter: String(card?.counter || "").trim(),
+          effect: String(card?.effect || "").trim(),
+        }))
+        .filter((card) => card.id || card.name)
+        .slice(0, 25)
+    : [],
+  candidateCards: Array.isArray(body.candidateCards)
+    ? body.candidateCards
+        .map((card) => ({
+          id: String(card?.id || card?.number || card?.code || "").trim(),
+          name: String(card?.name || "").trim(),
+          type: String(card?.type || "").trim(),
+          color: String(card?.color || "").trim(),
+          cost: toInteger(card?.cost, 0),
+          power: String(card?.power || "").trim(),
+          counter: String(card?.counter || "").trim(),
+          effect: String(card?.effect || "").trim(),
+        }))
+        .filter((card) => card.id || card.name)
+        .slice(0, 50)
+    : [],
+});
+
+const validateDeckUpgradePayload = (payload) => {
+  if (payload.deckCards.length === 0) {
+    return "Deck cards are required for deck upgrade suggestions.";
+  }
+  if (payload.candidateCards.length === 0) {
+    return "Candidate cards are required for deck upgrade suggestions.";
+  }
+  return null;
+};
+
 const buildVerdictPrompt = (payload) => `
 You are a tournament-level One Piece TCG deck coach.
 
@@ -380,6 +597,34 @@ Instructions:
 - Return valid JSON only with no markdown fences and no extra text.
 - Match this schema exactly:
 ${VERDICT_SHAPE_GUIDE}
+`.trim();
+
+const buildCardIntelPrompt = (payload) => `
+You are a One Piece TCG card intelligence assistant.
+
+Analyze the selected card inside the current deck context and return structured guidance.
+
+Leader:
+${payload.selectedLeader ? JSON.stringify(payload.selectedLeader) : "none"}
+
+Selected card:
+${payload.selectedCard ? JSON.stringify(payload.selectedCard) : "none"}
+
+Current deck cards:
+${payload.deckCards.length > 0 ? JSON.stringify(payload.deckCards) : "none"}
+
+Candidate cards from the real cards API:
+${payload.candidateCards.length > 0 ? JSON.stringify(payload.candidateCards) : "none"}
+
+Instructions:
+- comboPartners must use cardId values only from the candidate cards list.
+- replacementCards must use cardId values only from the candidate cards list.
+- Prefer cards that realistically fit the selected leader/color/game plan.
+- weakSpots should explain when the selected card underperforms.
+- bestFor should describe the kind of player who gets the best results from this card.
+- Return valid JSON only with no markdown fences and no extra text.
+- Match this schema exactly:
+${CARD_INTEL_SHAPE_GUIDE}
 `.trim();
 
 const requestProviderVerdict = async (provider, payload) => {
@@ -408,6 +653,34 @@ const requestProviderVerdict = async (provider, payload) => {
   }
 
   return verdict;
+};
+
+const requestProviderCardIntel = async (provider, payload) => {
+  const content = await requestProviderChat(
+    provider,
+    [
+      {
+        role: "system",
+        content:
+          "You are a precise One Piece TCG card intelligence assistant. Return only structured JSON grounded in the provided candidate cards.",
+      },
+      {
+        role: "user",
+        content: buildCardIntelPrompt(payload),
+      },
+    ],
+    {
+      temperature: 0.35,
+      responseFormat: { type: "json_object" },
+    },
+  );
+
+  const result = tryParseJson(content);
+  if (!result) {
+    throw new Error(`${provider.label} returned an unreadable card intelligence payload.`);
+  }
+
+  return result;
 };
 
 const tryParseJson = (content) => {
@@ -456,9 +729,37 @@ const requestProviderChat = async (provider, messages, options = {}) => {
   return data?.choices?.[0]?.message?.content || "";
 };
 
-const requestProviderAnalysis = async (provider, state) => {
-  const content = await requestProviderChat(
-    provider,
+const requestProviderChatWithFallback = async (messages, options = {}) => {
+  const providers = Array.isArray(options.providers) && options.providers.length > 0
+    ? options.providers
+    : resolveProviders();
+
+  if (!providers.length) {
+    const error = new Error(
+      "No AI provider is configured. Add GROQ_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY on the backend."
+    );
+    error.statusCode = 503;
+    throw error;
+  }
+
+  let lastError = null;
+  for (const provider of providers) {
+    try {
+      const content = await requestProviderChat(provider, messages, options);
+      return { content, provider };
+    } catch (error) {
+      lastError = error;
+      if (!shouldRetryWithAnotherProvider(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error("All AI providers failed.");
+};
+
+const requestProviderAnalysis = async (state) => {
+  const { content, provider } = await requestProviderChatWithFallback(
     [
       {
         role: "system",
@@ -481,7 +782,7 @@ const requestProviderAnalysis = async (provider, state) => {
     throw new Error(`${provider.label} returned an unreadable analysis payload.`);
   }
 
-  return analysis;
+  return { analysis, provider };
 };
 
 const buildGuidePrompt = ({ topic, context, question }) => `
@@ -506,22 +807,13 @@ Instructions:
 `.trim();
 
 const getGuideAssistance = async (req, res) => {
-  const provider = resolveProvider();
-  if (!provider) {
-    return res.status(503).json({
-      message:
-        "No AI provider is configured. Add GROQ_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY on the backend.",
-    });
-  }
-
   const payload = validateGuidePayload(req.body);
   if (payload.error) {
     return res.status(400).json({ message: payload.error });
   }
 
   try {
-    const answer = await requestProviderChat(
-      provider,
+    const { content: answer, provider } = await requestProviderChatWithFallback(
       [
         {
           role: "system",
@@ -557,14 +849,6 @@ const getGuideAssistance = async (req, res) => {
 };
 
 const getCoachAnalysis = async (req, res) => {
-  const provider = resolveProvider();
-  if (!provider) {
-    return res.status(503).json({
-      message:
-        "No AI provider is configured. Add GROQ_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY on the backend.",
-    });
-  }
-
   const state = sanitizePayload(req.body);
   const validationError = validatePayload(state);
   if (validationError) {
@@ -572,7 +856,7 @@ const getCoachAnalysis = async (req, res) => {
   }
 
   try {
-    const analysis = await requestProviderAnalysis(provider, state);
+    const { analysis, provider } = await requestProviderAnalysis(state);
 
     return res.json({
       provider: provider.name,
@@ -587,14 +871,6 @@ const getCoachAnalysis = async (req, res) => {
 };
 
 const getDeckVerdict = async (req, res) => {
-  const provider = resolveProvider();
-  if (!provider) {
-    return res.status(503).json({
-      message:
-        "No AI provider is configured. Add GROQ_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY on the backend.",
-    });
-  }
-
   const payload = sanitizeVerdictPayload(req.body);
   const validationError = validateVerdictPayload(payload);
   if (validationError) {
@@ -602,7 +878,27 @@ const getDeckVerdict = async (req, res) => {
   }
 
   try {
-    const verdict = await requestProviderVerdict(provider, payload);
+    const { content, provider } = await requestProviderChatWithFallback(
+      [
+        {
+          role: "system",
+          content:
+            "You are a strong One Piece TCG deck analyst. Return only structured JSON and keep recommendations grounded.",
+        },
+        {
+          role: "user",
+          content: buildVerdictPrompt(payload),
+        },
+      ],
+      {
+        temperature: 0.4,
+        responseFormat: { type: "json_object" },
+      }
+    );
+    const verdict = tryParseJson(content);
+    if (!verdict) {
+      throw new Error(`${provider.label} returned an unreadable verdict payload.`);
+    }
 
     return res.json({
       provider: provider.name,
@@ -616,10 +912,55 @@ const getDeckVerdict = async (req, res) => {
   }
 };
 
+const getCardIntelligence = async (req, res) => {
+  const payload = sanitizeCardIntelPayload(req.body);
+  const validationError = validateCardIntelPayload(payload);
+  if (validationError) {
+    return res.status(400).json({ message: validationError });
+  }
+
+  try {
+    const { content, provider } = await requestProviderChatWithFallback(
+      [
+        {
+          role: "system",
+          content:
+            "You are a precise One Piece TCG card intelligence assistant. Return only structured JSON grounded in the provided candidate cards.",
+        },
+        {
+          role: "user",
+          content: buildCardIntelPrompt(payload),
+        },
+      ],
+      {
+        temperature: 0.35,
+        responseFormat: { type: "json_object" },
+      }
+    );
+    const result = tryParseJson(content);
+    if (!result) {
+      throw new Error(`${provider.label} returned an unreadable card intelligence payload.`);
+    }
+
+    return res.json({
+      provider: provider.name,
+      model: provider.defaultModel,
+      result,
+    });
+  } catch (error) {
+    return res.status(error?.statusCode || 500).json({
+      message: error?.message || "Card intelligence request failed.",
+    });
+  }
+};
+
 module.exports = {
   getCoachAnalysis,
   getGuideAssistance,
   getDeckVerdict,
+  getCardIntelligence,
   resolveProvider,
+  resolveProviders,
   requestProviderChat,
+  requestProviderChatWithFallback,
 };

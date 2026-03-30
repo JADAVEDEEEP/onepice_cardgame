@@ -4,7 +4,7 @@ const tournamentsDb = require("../model/tournaments_db");
 const savedDeckDb = require("../model/saved_decks_db");
 const mongoose = require("mongoose");
 const { cacheGetJson, cacheSetJson } = require("../config/cache");
-const { resolveProvider, requestProviderChat } = require("./ai_controller");
+const { resolveProvider, requestProviderChat, requestProviderChatWithFallback } = require("./ai_controller");
 
 // Yeh helper kisi bhi numeric value ko safe number me convert karta hai.
 const parseNumber = (value, fallback = 0) => {
@@ -35,6 +35,7 @@ const ANALYTICS_OPTIMIZE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.A
 const ANALYTICS_GENERATE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_GENERATE_CACHE_TTL_MS, 120_000));
 const ANALYTICS_COLOR_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_COLOR_CACHE_TTL_MS, 120_000));
 const ANALYTICS_PROFILE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_PROFILE_CACHE_TTL_MS, 60_000));
+const ANALYTICS_COMPARE_CACHE_TTL_MS = Math.max(1000, parseNumber(process.env.ANALYTICS_COMPARE_CACHE_TTL_MS, 45_000));
 const ANALYTICS_CARD_FIELDS =
   "id card_code name colors color category type cost power counter_value counter traits types effect trigger text_effect rarity pack_id set_code img_full_url img_url tournament_status tournamentStatus status legality is_banned banned";
 const ANALYTICS_STANDING_FIELDS = "tournament date format placement player deck leaderImage";
@@ -54,6 +55,25 @@ const tryParseJsonObject = (value) => {
     }
   }
 };
+
+const COMPARE_DECKS_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["deckAWinPercent", "deckBWinPercent", "summary", "explanation"],
+  properties: {
+    deckAWinPercent: { type: "integer", minimum: 1, maximum: 99 },
+    deckBWinPercent: { type: "integer", minimum: 1, maximum: 99 },
+    summary: { type: "string" },
+    explanation: {
+      type: "array",
+      minItems: 3,
+      maxItems: 5,
+      items: { type: "string" },
+    },
+  },
+};
+
+const COMPARE_DECKS_SHAPE_GUIDE = JSON.stringify(COMPARE_DECKS_SCHEMA, null, 2);
 
 // Yeh helper standings se top meta leaders nikalta hai (DB-driven, no static list).
 const buildMetaLeaderRowsFromStandings = ({ standings, cards }) => {
@@ -684,9 +704,6 @@ const refineGeneratedDeckWithAI = async ({
   seedDeckCards,
   matchupPreview,
 }) => {
-  const provider = resolveProvider();
-  if (!provider) return null;
-
   const prompt = `
 You are a high-level One Piece TCG deckbuilding assistant inside DeckLab.
 
@@ -725,11 +742,10 @@ Rules:
 - Aim for exactly ${deckSize} cards total.
 - Prefer practical competitive tuning, not flavor.
 - insights should explain why this refined deck is strong for the requested playstyle/meta.
-`.trim();
+  `.trim();
 
   try {
-    const content = await requestProviderChat(
-      provider,
+    const { content, provider } = await requestProviderChatWithFallback(
       [
         {
           role: "system",
@@ -782,9 +798,6 @@ const refineOptimizedDeckWithAI = async ({
   recommendedCards,
   deckPowerScore,
 }) => {
-  const provider = resolveProvider();
-  if (!provider) return null;
-
   const compactDeck = expandedDeck.slice(0, 60).map((card) => ({
     code: card.card_code,
     name: card.name,
@@ -851,8 +864,7 @@ Rules:
 `.trim();
 
   try {
-    const content = await requestProviderChat(
-      provider,
+    const { content, provider } = await requestProviderChatWithFallback(
       [
         {
           role: "system",
@@ -1911,10 +1923,123 @@ const optimizeDeck = async (req, res) => {
   }
 };
 
+const compareDecksWithAI = async (req, res) => {
+  try {
+    const deckA = req.body?.deckA || null;
+    const deckB = req.body?.deckB || null;
+
+    if (!deckA || !deckB) {
+      return res.status(400).json({ message: "deckA and deckB are required" });
+    }
+
+    const normalizeCompareDeck = (deck) => ({
+      name: String(deck?.name || "").trim(),
+      source: String(deck?.source || "").trim(),
+      leaderName: String(deck?.leaderName || "").trim(),
+      leaderCode: String(deck?.leaderCode || "").trim(),
+      color: String(deck?.color || "").trim(),
+      baselineWinRate: clamp(parseNumber(deck?.baselineWinRate, 50), 1, 99),
+      cards: normalizeDeckItems(deck?.cards || deck?.deck_cards || [])
+        .slice(0, 25)
+        .map((item) => ({
+          card_code: item.card_code,
+          count: item.count,
+        })),
+    });
+
+    const normalizedA = normalizeCompareDeck(deckA);
+    const normalizedB = normalizeCompareDeck(deckB);
+
+    if (!normalizedA.name || normalizedA.cards.length === 0 || !normalizedB.name || normalizedB.cards.length === 0) {
+      return res.status(400).json({ message: "Both decks must include a name and at least one card." });
+    }
+
+    const cacheKey = `analytics:compare-ai:${JSON.stringify({
+      providerPreference: String(process.env.AI_PROVIDER || "").trim().toLowerCase() || "auto",
+      deckA: normalizedA,
+      deckB: normalizedB,
+    })}`;
+    const cached = await cacheGetJson(cacheKey);
+    if (cached) return res.json(cached);
+
+    const prompt = `
+You are a One Piece TCG matchup analyst.
+
+Compare these two decks and estimate which deck is more likely to win in a head-to-head matchup.
+
+Deck A:
+${JSON.stringify(normalizedA, null, 2)}
+
+Deck B:
+${JSON.stringify(normalizedB, null, 2)}
+
+Instructions:
+- Return only valid JSON.
+- deckAWinPercent and deckBWinPercent must sum to 100.
+- Use real matchup logic: speed, curve, interaction, consistency, leader fit, and card package.
+- summary should clearly say which deck is favored and why.
+- explanation must be 3 to 5 short reasons.
+- Match this schema exactly:
+${COMPARE_DECKS_SHAPE_GUIDE}
+    `.trim();
+
+    const { content, provider } = await requestProviderChatWithFallback(
+      [
+        {
+          role: "system",
+          content:
+            "You are a sharp One Piece TCG matchup specialist. Return only structured JSON and keep probabilities realistic.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      {
+        temperature: 0.35,
+        responseFormat: { type: "json_object" },
+      }
+    );
+
+    const parsed = tryParseJsonObject(content);
+    if (!parsed) {
+      throw new Error(`${provider.label} returned an unreadable compare payload.`);
+    }
+
+    let deckAWinPercent = clamp(parseNumber(parsed.deckAWinPercent, 50), 1, 99);
+    let deckBWinPercent = clamp(parseNumber(parsed.deckBWinPercent, 50), 1, 99);
+    const total = deckAWinPercent + deckBWinPercent;
+    if (total !== 100) {
+      deckAWinPercent = clamp(Math.round((deckAWinPercent / total) * 100), 1, 99);
+      deckBWinPercent = 100 - deckAWinPercent;
+    }
+
+    const response = {
+      provider: provider.name,
+      model: provider.defaultModel,
+      deckAWinPercent,
+      deckBWinPercent,
+      summary: String(parsed.summary || "").trim(),
+      explanation: Array.isArray(parsed.explanation)
+        ? parsed.explanation.map((item) => String(item || "").trim()).filter(Boolean).slice(0, 5)
+        : [],
+      generated_at: new Date().toISOString(),
+    };
+
+    await cacheSetJson(cacheKey, response, ANALYTICS_COMPARE_CACHE_TTL_MS);
+    return res.json(response);
+  } catch (error) {
+    return res.status(error?.statusCode || 500).json({
+      message: error?.message || "Failed to compare decks with AI",
+    });
+  }
+};
+
 module.exports = {
   getMatchupMatrix,
   getSavedDeckProfile,
   bestColorFinder,
   generateBestDeck,
   optimizeDeck,
+  compareDecksWithAI,
 };
