@@ -106,6 +106,92 @@ const ANALYSIS_SCHEMA = {
 
 const ANALYSIS_SHAPE_GUIDE = JSON.stringify(ANALYSIS_SCHEMA, null, 2);
 
+const VERDICT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "deckRecommendation",
+    "gamePlan",
+    "coreMoves",
+    "whyThisDeckWins",
+    "importantNote",
+    "aiLogic",
+  ],
+  properties: {
+    deckRecommendation: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "name",
+        "colors",
+        "archetype",
+        "difficulty",
+        "bestMatchups",
+        "worstMatchups",
+        "winProbability",
+      ],
+      properties: {
+        name: { type: "string" },
+        colors: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 3 },
+        archetype: { type: "string" },
+        difficulty: { type: "string", enum: ["Beginner", "Intermediate", "Advanced", "Expert"] },
+        bestMatchups: { type: "array", items: { type: "string" }, minItems: 2, maxItems: 4 },
+        worstMatchups: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 3 },
+        winProbability: { type: "integer", minimum: 1, maximum: 99 },
+      },
+    },
+    gamePlan: {
+      type: "array",
+      minItems: 3,
+      maxItems: 3,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["phase", "turns", "plan"],
+        properties: {
+          phase: { type: "string" },
+          turns: { type: "string" },
+          plan: { type: "array", items: { type: "string" }, minItems: 3, maxItems: 5 },
+        },
+      },
+    },
+    coreMoves: {
+      type: "array",
+      minItems: 3,
+      maxItems: 5,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["num", "name", "why"],
+        properties: {
+          num: { type: "integer", minimum: 1, maximum: 28 },
+          name: { type: "string" },
+          why: { type: "string" },
+        },
+      },
+    },
+    whyThisDeckWins: { type: "string" },
+    importantNote: { type: "string" },
+    aiLogic: {
+      type: "array",
+      minItems: 4,
+      maxItems: 6,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["input", "weight", "explanation"],
+        properties: {
+          input: { type: "string" },
+          weight: { type: "string" },
+          explanation: { type: "string" },
+        },
+      },
+    },
+  },
+};
+
+const VERDICT_SHAPE_GUIDE = JSON.stringify(VERDICT_SCHEMA, null, 2);
+
 const toInteger = (value, fallback = 0) => {
   const parsed = Number.parseInt(String(value ?? ""), 10);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -127,6 +213,22 @@ const sanitizePayload = (body = {}) => ({
   triggerDeck: toBoolean(body.triggerDeck),
   aggressiveMode: toBoolean(body.aggressiveMode),
   defensiveMode: toBoolean(body.defensiveMode),
+  importedLeader: body.importedLeader && typeof body.importedLeader === "object" ? body.importedLeader : null,
+  importedCards: Array.isArray(body.importedCards)
+    ? body.importedCards
+        .map((card) => ({
+          id: String(card?.id || card?.number || card?.code || "").trim(),
+          name: String(card?.name || "").trim(),
+          type: String(card?.type || "").trim(),
+          color: String(card?.color || "").trim(),
+          cost: toInteger(card?.cost, 0),
+          power: String(card?.power || "").trim(),
+          role: String(card?.role || "").trim(),
+          effect: String(card?.effect || card?.simpleMeaning || "").trim(),
+        }))
+        .filter((card) => card.id || card.name)
+        .slice(0, 25)
+    : [],
 });
 
 const validatePayload = (payload) => {
@@ -211,6 +313,8 @@ Analyze this board state:
 - Trigger-focused deck: ${state.triggerDeck ? "yes" : "no"}
 - Aggressive mode preference: ${state.aggressiveMode ? "yes" : "no"}
 - Defensive mode preference: ${state.defensiveMode ? "yes" : "no"}
+- Imported leader: ${state.importedLeader ? JSON.stringify(state.importedLeader) : "none"}
+- Imported deck cards: ${state.importedCards.length > 0 ? JSON.stringify(state.importedCards) : "none"}
 
 Rules for the answer:
 - Treat this as coaching, not certainty.
@@ -225,6 +329,86 @@ Rules for the answer:
 - Match this schema exactly:
 ${ANALYSIS_SHAPE_GUIDE}
 `.trim();
+
+const sanitizeVerdictPayload = (body = {}) => ({
+  importedLeader: body.importedLeader && typeof body.importedLeader === "object" ? body.importedLeader : null,
+  importedCards: Array.isArray(body.importedCards)
+    ? body.importedCards
+        .map((card) => ({
+          id: String(card?.id || card?.number || card?.code || "").trim(),
+          name: String(card?.name || "").trim(),
+          type: String(card?.type || "").trim(),
+          color: String(card?.color || "").trim(),
+          cost: toInteger(card?.cost, 0),
+          power: String(card?.power || "").trim(),
+          role: String(card?.role || "").trim(),
+          effect: String(card?.effect || card?.simpleMeaning || "").trim(),
+        }))
+        .filter((card) => card.id || card.name)
+        .slice(0, 30)
+    : [],
+  notes: String(body.notes || "").trim().slice(0, 1200),
+});
+
+const validateVerdictPayload = (payload) => {
+  if (!payload.importedLeader && payload.importedCards.length === 0) {
+    return "Import a leader or deck cards before requesting AI verdict.";
+  }
+  return null;
+};
+
+const buildVerdictPrompt = (payload) => `
+You are a tournament-level One Piece TCG deck coach.
+
+Analyze this imported deck snapshot and produce a practical verdict for the player.
+
+Imported leader:
+${payload.importedLeader ? JSON.stringify(payload.importedLeader) : "none"}
+
+Imported cards:
+${payload.importedCards.length > 0 ? JSON.stringify(payload.importedCards) : "none"}
+
+Extra notes:
+${payload.notes || "none"}
+
+Instructions:
+- Infer the most likely deck identity from the imported leader/cards.
+- Be honest about strengths and weak matchups.
+- Keep matchup labels short and plausible rather than overconfident.
+- Core moves should map to real gameplay concepts and masterpiece-style ideas.
+- importantNote should be honest and cautionary, not hype.
+- Return valid JSON only with no markdown fences and no extra text.
+- Match this schema exactly:
+${VERDICT_SHAPE_GUIDE}
+`.trim();
+
+const requestProviderVerdict = async (provider, payload) => {
+  const content = await requestProviderChat(
+    provider,
+    [
+      {
+        role: "system",
+        content:
+          "You are a strong One Piece TCG deck analyst. Return only structured JSON and keep recommendations grounded.",
+      },
+      {
+        role: "user",
+        content: buildVerdictPrompt(payload),
+      },
+    ],
+    {
+      temperature: 0.4,
+      responseFormat: { type: "json_object" },
+    },
+  );
+
+  const verdict = tryParseJson(content);
+  if (!verdict) {
+    throw new Error(`${provider.label} returned an unreadable verdict payload.`);
+  }
+
+  return verdict;
+};
 
 const tryParseJson = (content) => {
   if (typeof content !== "string" || !content.trim()) return null;
@@ -402,9 +586,40 @@ const getCoachAnalysis = async (req, res) => {
   }
 };
 
+const getDeckVerdict = async (req, res) => {
+  const provider = resolveProvider();
+  if (!provider) {
+    return res.status(503).json({
+      message:
+        "No AI provider is configured. Add GROQ_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY on the backend.",
+    });
+  }
+
+  const payload = sanitizeVerdictPayload(req.body);
+  const validationError = validateVerdictPayload(payload);
+  if (validationError) {
+    return res.status(400).json({ message: validationError });
+  }
+
+  try {
+    const verdict = await requestProviderVerdict(provider, payload);
+
+    return res.json({
+      provider: provider.name,
+      model: provider.defaultModel,
+      verdict,
+    });
+  } catch (error) {
+    return res.status(error?.statusCode || 500).json({
+      message: error?.message || "AI Verdict request failed.",
+    });
+  }
+};
+
 module.exports = {
   getCoachAnalysis,
   getGuideAssistance,
+  getDeckVerdict,
   resolveProvider,
   requestProviderChat,
 };

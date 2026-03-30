@@ -1,7 +1,12 @@
 //importing the required modules so we can use their moudueles fucnality in our code
 require("dotenv").config();
 const express = require('express');
-const compression = require("compression");
+let compression = null;
+try {
+  compression = require("compression");
+} catch {
+  compression = null;
+}
 const cors = require("cors");
 const cards = require('./routes/card');
 const meta = require('./routes/meta');
@@ -55,7 +60,9 @@ const corsOptions = {
 
 //parssing the incoimg request body as json data in to the javascript object
 app.use(express.json({ limit: "1mb" }));
-app.use(compression());
+if (typeof compression === "function") {
+  app.use(compression());
+}
 app.use(cors(corsOptions));
 app.use(createRateLimiter());
 

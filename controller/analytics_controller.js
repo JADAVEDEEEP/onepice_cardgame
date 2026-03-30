@@ -768,6 +768,128 @@ Rules:
   }
 };
 
+const refineOptimizedDeckWithAI = async ({
+  leader,
+  expandedDeck,
+  costCurve,
+  roleBreakdown,
+  synergyScore,
+  consistencyScore,
+  metaFitScore,
+  weaknesses,
+  targetPlan,
+  nextBestSwaps,
+  recommendedCards,
+  deckPowerScore,
+}) => {
+  const provider = resolveProvider();
+  if (!provider) return null;
+
+  const compactDeck = expandedDeck.slice(0, 60).map((card) => ({
+    code: card.card_code,
+    name: card.name,
+    cost: card.cost,
+    type: card.type,
+    color: card.color,
+    power: card.power,
+    counter: card.counter_value,
+  }));
+
+  const prompt = `
+You are a tournament-level One Piece TCG deck optimization analyst.
+
+Your task:
+- Analyze the provided built deck.
+- Improve the optimization report using strategic reasoning.
+- Return JSON only.
+
+Inputs:
+- Leader: ${leader ? `${leader.name || leader.card_code || "Unknown"} (${leader.color || "unknown"})` : "Unknown"}
+- Deck cards:
+${compactDeck.map((card) => `- ${card.code} | ${card.name} | ${card.type} | ${card.color} | cost ${card.cost} | power ${card.power} | counter ${card.counter}`).join("\n")}
+
+- Existing heuristic summary:
+costCurve: ${JSON.stringify(costCurve)}
+roleBreakdown: ${JSON.stringify(roleBreakdown)}
+synergyScore: ${JSON.stringify(synergyScore)}
+consistencyScore: ${JSON.stringify(consistencyScore)}
+metaFitScore: ${JSON.stringify(metaFitScore)}
+weaknesses: ${JSON.stringify(weaknesses)}
+targetPlan: ${JSON.stringify(targetPlan)}
+nextBestSwaps: ${JSON.stringify(nextBestSwaps)}
+recommendedCards: ${JSON.stringify(recommendedCards)}
+deckPowerScore: ${deckPowerScore}
+
+Return this JSON shape exactly:
+{
+  "summary": "short overall optimization summary",
+  "deckPower": { "score": 78, "tier": "A" },
+  "consistencyScore": { "score": 70, "explanation": "..." },
+  "metaFitScore": { "score": 66, "explanation": "...", "estimatedWinPercent": 61 },
+  "pilotProfile": { "title": "Aggressive Pressure Player", "explanation": "..." },
+  "weaknesses": ["...", "..."],
+  "recommendedCards": [
+    { "cardName": "Card", "cardId": "OP01-001", "explanation": "..." }
+  ],
+  "nextBestSwaps": [
+    {
+      "remove": { "cardName": "Old Card", "cardId": "OP01-002" },
+      "add": { "cardName": "New Card", "cardId": "OP01-003" },
+      "reason": "...",
+      "expectedImpact": 6
+    }
+  ],
+  "insights": ["...", "...", "..."]
+}
+
+Rules:
+- Keep the response practical and competitive.
+- Do not invent cards that are not already mentioned in nextBestSwaps or recommendedCards inputs.
+- estimatedWinPercent must be between 1 and 99.
+- deckPower.score, consistencyScore.score, metaFitScore.score must be between 1 and 100.
+- nextBestSwaps expectedImpact must be between 1 and 15.
+`.trim();
+
+  try {
+    const content = await requestProviderChat(
+      provider,
+      [
+        {
+          role: "system",
+          content: "You are a precise One Piece TCG optimization analyst. Return JSON only.",
+        },
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+      {
+        temperature: 0.35,
+        responseFormat: { type: "json_object" },
+      }
+    );
+
+    const parsed = tryParseJsonObject(content);
+    if (!parsed || typeof parsed !== "object") return null;
+
+    return {
+      provider: provider.name,
+      model: provider.defaultModel,
+      summary: String(parsed.summary || "").trim(),
+      deckPower: parsed.deckPower || null,
+      consistencyScore: parsed.consistencyScore || null,
+      metaFitScore: parsed.metaFitScore || null,
+      pilotProfile: parsed.pilotProfile || null,
+      weaknesses: Array.isArray(parsed.weaknesses) ? parsed.weaknesses.filter(Boolean).slice(0, 6) : [],
+      recommendedCards: Array.isArray(parsed.recommendedCards) ? parsed.recommendedCards.slice(0, 10) : [],
+      nextBestSwaps: Array.isArray(parsed.nextBestSwaps) ? parsed.nextBestSwaps.slice(0, 8) : [],
+      insights: Array.isArray(parsed.insights) ? parsed.insights.filter(Boolean).slice(0, 5) : [],
+    };
+  } catch (error) {
+    return null;
+  }
+};
+
 // Yeh helper card pool fallback se color-wise high-level stats banata hai.
 const buildBestColorStatsFromCards = (cards) => {
   const colors = ["red", "blue", "green", "purple", "black", "yellow"];
@@ -1723,7 +1845,9 @@ const optimizeDeck = async (req, res) => {
       )
     );
 
-    const response = {
+    const aiRefined = await refineOptimizedDeckWithAI({
+      leader,
+      expandedDeck,
       costCurve,
       roleBreakdown,
       synergyScore,
@@ -1731,14 +1855,53 @@ const optimizeDeck = async (req, res) => {
       metaFitScore,
       weaknesses,
       targetPlan,
-      optimizationSuggestions,
       nextBestSwaps,
       recommendedCards,
+      deckPowerScore,
+    });
+
+    const response = {
+      costCurve,
+      roleBreakdown,
+      synergyScore,
+      consistencyScore: aiRefined?.consistencyScore?.score
+        ? {
+            ...consistencyScore,
+            score: clamp(parseNumber(aiRefined.consistencyScore.score, consistencyScore.score)),
+            aiExplanation: String(aiRefined.consistencyScore.explanation || "").trim(),
+          }
+        : consistencyScore,
+      metaFitScore: aiRefined?.metaFitScore?.score
+        ? {
+            ...metaFitScore,
+            score: clamp(parseNumber(aiRefined.metaFitScore.score, metaFitScore.score)),
+            estimatedWinPercent: clamp(parseNumber(aiRefined.metaFitScore.estimatedWinPercent, metaFitScore.score), 1, 99),
+            aiExplanation: String(aiRefined.metaFitScore.explanation || "").trim(),
+          }
+        : {
+            ...metaFitScore,
+            estimatedWinPercent: clamp(parseNumber(metaFitScore.score, 50), 1, 99),
+          },
+      weaknesses: aiRefined?.weaknesses?.length ? aiRefined.weaknesses : weaknesses,
+      targetPlan,
+      optimizationSuggestions,
+      nextBestSwaps: aiRefined?.nextBestSwaps?.length ? aiRefined.nextBestSwaps : nextBestSwaps,
+      recommendedCards: aiRefined?.recommendedCards?.length ? aiRefined.recommendedCards : recommendedCards,
       deck_power: {
-        score: deckPowerScore,
-        tier: deckPowerScore >= 85 ? "S" : deckPowerScore >= 70 ? "A" : deckPowerScore >= 55 ? "B" : deckPowerScore >= 40 ? "C" : "D",
+        score: aiRefined?.deckPower?.score
+          ? clamp(parseNumber(aiRefined.deckPower.score, deckPowerScore))
+          : deckPowerScore,
+        tier:
+          String(aiRefined?.deckPower?.tier || "").trim() ||
+          (deckPowerScore >= 85 ? "S" : deckPowerScore >= 70 ? "A" : deckPowerScore >= 55 ? "B" : deckPowerScore >= 40 ? "C" : "D"),
       },
       suggestions,
+      ai_summary: aiRefined?.summary || "",
+      ai_insights: aiRefined?.insights || [],
+      pilot_profile: aiRefined?.pilotProfile || null,
+      analysis_mode: aiRefined ? "ai-refined" : "heuristic",
+      analysis_provider: aiRefined?.provider || null,
+      analysis_model: aiRefined?.model || null,
       generated_at: new Date().toISOString(),
     };
     await cacheSetJson(cacheKey, response, ANALYTICS_OPTIMIZE_CACHE_TTL_MS);
