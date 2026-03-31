@@ -3,6 +3,7 @@ const PROVIDERS = {
     label: "OpenAI",
     envKeyName: "OPENAI_API_KEY",
     apiKey: process.env.OPENAI_API_KEY || "",
+    transport: "openai",
     url: "https://api.openai.com/v1/chat/completions",
     defaultModel: process.env.OPENAI_MODEL || "gpt-4.1-mini",
     extraHeaders: {},
@@ -11,6 +12,7 @@ const PROVIDERS = {
     label: "Groq",
     envKeyName: "GROQ_API_KEY",
     apiKey: process.env.GROQ_API_KEY || "",
+    transport: "openai",
     url: "https://api.groq.com/openai/v1/chat/completions",
     defaultModel: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
     extraHeaders: {},
@@ -19,6 +21,7 @@ const PROVIDERS = {
     label: "OpenRouter",
     envKeyName: "OPENROUTER_API_KEY",
     apiKey: process.env.OPENROUTER_API_KEY || "",
+    transport: "openai",
     url: "https://openrouter.ai/api/v1/chat/completions",
     defaultModel:
       process.env.OPENROUTER_MODEL || "meta-llama/llama-3.3-70b-instruct",
@@ -26,6 +29,15 @@ const PROVIDERS = {
       "HTTP-Referer": process.env.OPENROUTER_SITE_URL || "http://localhost:5173",
       "X-Title": process.env.OPENROUTER_APP_NAME || "One Piece TCG AI Coach",
     },
+  },
+  gemini: {
+    label: "Gemini",
+    envKeyName: "GEMINI_API_KEY",
+    apiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "",
+    transport: "gemini",
+    url: "https://generativelanguage.googleapis.com/v1beta/models",
+    defaultModel: process.env.GEMINI_MODEL || "gemini-2.0-flash",
+    extraHeaders: {},
   },
 };
 
@@ -700,6 +712,63 @@ const tryParseJson = (content) => {
 };
 
 const requestProviderChat = async (provider, messages, options = {}) => {
+  if (provider.transport === "gemini") {
+    const systemMessages = messages.filter((message) => message?.role === "system");
+    const nonSystemMessages = messages.filter((message) => message?.role !== "system");
+
+    const geminiResponse = await fetch(
+      `${provider.url}/${encodeURIComponent(provider.defaultModel)}:generateContent?key=${encodeURIComponent(provider.apiKey)}`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...provider.extraHeaders,
+        },
+        body: JSON.stringify({
+          ...(systemMessages.length
+            ? {
+                systemInstruction: {
+                  parts: [
+                    {
+                      text: systemMessages.map((message) => String(message.content || "")).join("\n\n"),
+                    },
+                  ],
+                },
+              }
+            : {}),
+          contents: nonSystemMessages.map((message) => ({
+            role: message?.role === "assistant" ? "model" : "user",
+            parts: [{ text: String(message?.content || "") }],
+          })),
+          generationConfig: {
+            temperature: options.temperature ?? 0.3,
+            ...(options.responseFormat?.type === "json_object"
+              ? { responseMimeType: "application/json" }
+              : {}),
+          },
+        }),
+      }
+    );
+
+    const data = await geminiResponse.json().catch(() => ({}));
+    if (!geminiResponse.ok) {
+      const errorMessage =
+        data?.error?.message ||
+        `${provider.label} analysis request failed.`;
+      const error = new Error(errorMessage);
+      error.statusCode = geminiResponse.status;
+      throw error;
+    }
+
+    const content =
+      data?.candidates?.[0]?.content?.parts
+        ?.map((part) => String(part?.text || ""))
+        .join("\n")
+        .trim() || "";
+
+    return content;
+  }
+
   const response = await fetch(provider.url, {
     method: "POST",
     headers: {
@@ -736,7 +805,7 @@ const requestProviderChatWithFallback = async (messages, options = {}) => {
 
   if (!providers.length) {
     const error = new Error(
-      "No AI provider is configured. Add GROQ_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY on the backend."
+      "No AI provider is configured. Add GROQ_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY on the backend."
     );
     error.statusCode = 503;
     throw error;
