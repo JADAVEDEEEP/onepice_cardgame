@@ -4,7 +4,7 @@ const TopicAlertState = require("../model/topic_alert_state_db");
 const { resolveProvider, requestProviderChat } = require("../controller/ai_controller");
 
 const TOPICS_URL =
-  process.env.TOPICS_WATCH_URL || "https://en.onepiece-cardgame.com/topics/";
+  process.env.TOPICS_WATCH_URL || "https://en.onepiece-cardgame.com/news/?category=events";
 const WATCH_INTERVAL_MS = Math.max(
   60_000,
   Number(process.env.TOPICS_WATCH_INTERVAL_MS) || 10 * 60_000
@@ -54,6 +54,20 @@ const toAbsoluteUrl = (href) => {
 const normalizeSpace = (text) => String(text || "").replace(/\s+/g, " ").trim();
 const DATE_PATTERN =
   /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}\b/i;
+const DETAIL_DATE_SELECTORS = [
+  'meta[property="article:published_time"]',
+  'meta[name="article:published_time"]',
+  'meta[name="publish_date"]',
+  'meta[name="date"]',
+  'meta[itemprop="datePublished"]',
+  "time[datetime]",
+  "time",
+  ".topicDate",
+  ".date",
+  ".news-date",
+  ".entry-date",
+  ".post-date",
+];
 
 const extractDateFromText = (text) => {
   const normalized = normalizeSpace(text);
@@ -62,30 +76,50 @@ const extractDateFromText = (text) => {
   return match ? normalizeSpace(match[0]) : "";
 };
 
+const hasDeclaredDate = (value) => Boolean(extractDateFromText(value));
+
+const extractDeclaredDateFromHtml = (html) => {
+  const $ = load(String(html || ""));
+  for (const selector of DETAIL_DATE_SELECTORS) {
+    const element = $(selector).first();
+    if (!element || element.length === 0) continue;
+    const candidate = normalizeSpace(element.attr("content") || element.attr("datetime") || element.text());
+    const found = extractDateFromText(candidate);
+    if (found) return found;
+  }
+
+  const fallbackText = normalizeSpace($("body").text());
+  return extractDateFromText(fallbackText);
+};
+
 const extractTopicPosts = (html) => {
   const $ = load(html);
   const seen = new Set();
   const posts = [];
 
-  $("a[href]").each((_, el) => {
-    const href = normalizeSpace($(el).attr("href"));
+  const addFromLink = (linkEl, cardEl) => {
+    const href = normalizeSpace(linkEl.attr("href"));
     if (!href) return;
     const url = toAbsoluteUrl(href);
-    if (!url || url === TOPICS_URL || url.endsWith("/topics/")) return;
+    if (!url || url === TOPICS_URL || url.endsWith("/topics/") || url.endsWith("/news/")) return;
 
-    const title = normalizeSpace($(el).text());
+    const title = normalizeSpace(
+      linkEl.find(".newsTitle, .topicTit, .js_topicTit, h2, h3, h4").first().text() ||
+      linkEl.attr("title") ||
+      linkEl.text()
+    );
     if (!title || title.length < 3) return;
 
-    const card = $(el).closest(
-      "li, article, section, .topics-list-item, .news-list-item, .news_item, .topics_item, .post, .item, .entry"
+    const card = cardEl && cardEl.length ? cardEl : linkEl.closest(
+      "li, article, section, .topicDetail, .topics-list-item, .news-list-item, .news_item, .topics_item, .post, .item, .entry"
     );
-    const parentText = normalizeSpace($(el).parent().text());
-    const grandParentText = normalizeSpace($(el).parent().parent().text());
+    const parentText = normalizeSpace(linkEl.parent().text());
+    const grandParentText = normalizeSpace(linkEl.parent().parent().text());
     const cardText = normalizeSpace(card.text());
     const dateText = normalizeSpace(
       card.find("time").first().attr("datetime") ||
       card.find("time").first().text() ||
-      card.find(".date, .news-date, .topics-date, .entry-date, .post-date").first().text() ||
+      card.find(".topicDate, .date, .news-date, .topics-date, .entry-date, .post-date").first().text() ||
       extractDateFromText(parentText) ||
       extractDateFromText(grandParentText) ||
       extractDateFromText(cardText) ||
@@ -109,9 +143,66 @@ const extractTopicPosts = (html) => {
       published_at: publishedAt,
       summary: summary || title,
     });
+  };
+
+  $(".newsListLink").each((_, el) => {
+    addFromLink($(el), $(el));
+  });
+
+  $(".topicsBox .topicDetail, li.topicDetail, .topics-list-item, .news-list-item").each((_, el) => {
+    const card = $(el);
+    const link = card.find("a[href]").first();
+    if (!link || link.length === 0) return;
+    addFromLink(link, card);
   });
 
   return posts;
+};
+
+const fetchHtml = async (url) => {
+  const cacheBustUrl = `${url}${url.includes("?") ? "&" : "?"}_ts=${Date.now()}`;
+  const fetchTimeoutMs = Math.max(3_000, Number(process.env.TOPICS_FETCH_TIMEOUT_MS) || 12_000);
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), fetchTimeoutMs);
+  try {
+    const response = await fetch(cacheBustUrl, {
+      headers: {
+        "user-agent": "OPTCGDeckLabWatcher/1.0 (+email-alert)",
+        "cache-control": "no-cache",
+        pragma: "no-cache",
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`Topics fetch failed with status ${response.status}`);
+    }
+    return await response.text();
+  } finally {
+    clearTimeout(t);
+  }
+};
+
+const hydrateDeclaredDates = async (posts) => {
+  const targets = posts.filter((post) => !hasDeclaredDate(post.published_at) && post.url);
+  if (targets.length === 0) return posts;
+
+  const hydrateLimit = Math.max(1, Math.min(40, Number(process.env.TOPICS_DATE_HYDRATE_LIMIT) || 20));
+  const selected = targets.slice(0, hydrateLimit);
+  const hydrated = await Promise.all(
+    selected.map(async (post) => {
+      try {
+        const html = await fetchHtml(post.url);
+        const declaredDate = extractDeclaredDateFromHtml(html);
+        if (!declaredDate) return post;
+        return { ...post, published_at: declaredDate };
+      } catch {
+        return post;
+      }
+    })
+  );
+
+  const byKey = new Map(hydrated.map((item) => [item.event_key, item]));
+  return posts.map((post) => byKey.get(post.event_key) || post);
 };
 
 const escapeHtml = (value) =>
@@ -363,24 +454,9 @@ const sendTopicWatcherTestEmail = async () => {
 };
 
 const fetchTopicPostsOnce = async () => {
-  const cacheBustUrl = `${TOPICS_URL}${TOPICS_URL.includes("?") ? "&" : "?"}_ts=${Date.now()}`;
-  const fetchTimeoutMs = Math.max(3_000, Number(process.env.TOPICS_FETCH_TIMEOUT_MS) || 12_000);
-  const controller = new AbortController();
-  const t = setTimeout(() => controller.abort(), fetchTimeoutMs);
-  const response = await fetch(cacheBustUrl, {
-    headers: {
-      "user-agent": "OPTCGDeckLabWatcher/1.0 (+email-alert)",
-      "cache-control": "no-cache",
-      pragma: "no-cache",
-    },
-    signal: controller.signal,
-  });
-  clearTimeout(t);
-  if (!response.ok) {
-    throw new Error(`Topics fetch failed with status ${response.status}`);
-  }
-  const html = await response.text();
-  return extractTopicPosts(html);
+  const html = await fetchHtml(TOPICS_URL);
+  const posts = extractTopicPosts(html);
+  return hydrateDeclaredDates(posts);
 };
 
 const runTopicWatcherOnce = async () => {
